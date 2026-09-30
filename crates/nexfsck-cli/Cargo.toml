@@ -1,0 +1,21 @@
+[package]
+name = "nexfsck"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nexfsck"
+path = "src/main.rs"
+
+[dependencies]
+nexfsck-core = { path = "../nexfsck-core" }
+nexfsck-io = { path = "../nexfsck-io" }
+nexfsck-compute = { path = "../nexfsck-compute" }
+nexfsck-gpu = { path = "../nexfsck-gpu" }
+nexfsck-journal = { path = "../nexfsck-journal" }
+nexfsck-tui = { path = "../nexfsck-tui" }
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

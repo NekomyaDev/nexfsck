@@ -1,0 +1,13 @@
+[package]
+name = "nexfsck-io"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nexfsck-core = { path = "../nexfsck-core" }
+zerocopy.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

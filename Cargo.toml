@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/nexfsck-core",
+    "crates/nexfsck-io",
+    "crates/nexfsck-compute",
+    "crates/nexfsck-gpu",
+    "crates/nexfsck-journal",
+    "crates/nexfsck-tui",
+    "crates/nexfsck-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["NekomyaDev <nekomyadev@users.noreply.github.com>"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/NekomyaDev/nexfsck"
+keywords = ["fsck", "ext4", "io_uring", "gpu", "simd"]
+categories = ["filesystem", "command-line-utilities", "hardware-support"]
+
+[workspace.dependencies]
+zerocopy = { version = "0.8", features = ["derive"] }
+byteorder = "1.5"
+crc32fast = "1.4"
+rayon = "1.10"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2.0"
+bitflags = "2.6"
+roaring = "0.10"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
