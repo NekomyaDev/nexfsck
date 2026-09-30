@@ -229,6 +229,7 @@ dependencies = [
  "nexfsck-tui",
  "tracing",
  "tracing-subscriber",
+ "zerocopy",
 ]
 
 [[package]]
@@ -279,8 +280,10 @@ name = "nexfsck-journal"
 version = "0.1.0"
 dependencies = [
  "nexfsck-core",
+ "nexfsck-io",
  "thiserror",
  "tracing",
+ "zerocopy",
 ]
 
 [[package]]

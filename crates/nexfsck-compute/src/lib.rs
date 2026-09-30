@@ -1,7 +1,8 @@
 //! `nexfsck-compute`
 //!
 //! Multi-core SIMD compute engine, hardware auto-discovery,
-//! extent tree analysis, and parallel bitmap state reduction.
+//! multi-level extent tree analysis, directory validation,
+//! and parallel bitmap state reduction.
 
 use crc32fast::Hasher;
 use rayon::prelude::*;
@@ -10,7 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use zerocopy::FromBytes;
 
-use nexfsck_core::{Ext4Extent, Ext4ExtentHeader, Ext4Inode};
+use nexfsck_core::{
+    Ext4DirEntry2Header, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, Ext4Inode,
+    EXT4_FT_DIR_CSUM,
+};
 
 /// Hardware profile detected at startup.
 #[derive(Debug, Clone)]
@@ -109,7 +113,7 @@ impl InodeVerificationStats {
 pub struct BlockAllocationTracker {
     total_blocks: u64,
     allocated_count: AtomicU64,
-    bitmap: RwLock<RoaringBitmap>,
+    pub bitmap: RwLock<RoaringBitmap>,
 }
 
 impl BlockAllocationTracker {
@@ -143,6 +147,14 @@ impl BlockAllocationTracker {
     pub fn allocated_count(&self) -> u64 {
         self.allocated_count.load(Ordering::Relaxed)
     }
+
+    pub fn is_allocated(&self, block: u64) -> bool {
+        if block >= u32::MAX as u64 {
+            return false;
+        }
+        let bm = self.bitmap.read().unwrap();
+        bm.contains(block as u32)
+    }
 }
 
 /// Validates a batch of inodes in parallel using Rayon work-stealing.
@@ -173,18 +185,35 @@ pub fn verify_inodes_parallel(
         // Validate extent tree if used
         if inode.uses_extents() && !inode.is_inline_data() {
             stats.extent_trees_checked.fetch_add(1, Ordering::Relaxed);
-            verify_extent_root(inode, tracker, stats);
+            verify_extent_block(
+                &inode.i_block,
+                tracker.total_blocks(),
+                tracker,
+                stats,
+                &|_| None,
+                0,
+            );
         }
     });
 }
 
-/// Verifies root extents embedded directly in `inode.i_block`.
-fn verify_extent_root(
-    inode: &Ext4Inode,
+/// Multi-level extent tree verification with depth bounding (max depth 5).
+pub fn verify_extent_block<F>(
+    data: &[u8],
+    max_blocks: u64,
     tracker: &BlockAllocationTracker,
     stats: &InodeVerificationStats,
-) {
-    let (header, rest) = match Ext4ExtentHeader::ref_from_prefix(&inode.i_block) {
+    read_block_fn: &F,
+    current_depth: u16,
+) where
+    F: Fn(u64) -> Option<Vec<u8>>,
+{
+    if current_depth > 5 {
+        stats.extent_corruptions.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    let (header, rest) = match Ext4ExtentHeader::ref_from_prefix(data) {
         Ok(res) => res,
         Err(_) => {
             stats.extent_corruptions.fetch_add(1, Ordering::Relaxed);
@@ -200,13 +229,13 @@ fn verify_extent_root(
     let entries = header.entries() as usize;
     let max_entries = header.max() as usize;
 
-    if entries > max_entries || entries > 4 {
+    if entries > max_entries {
         stats.extent_corruptions.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
     if header.depth() == 0 {
-        // Leaf nodes directly inside i_block
+        // Leaf nodes
         let extent_size = std::mem::size_of::<Ext4Extent>();
         for i in 0..entries {
             let offset = i * extent_size;
@@ -219,12 +248,126 @@ fn verify_extent_root(
                 let start_block = ext.physical_start();
                 let count = ext.block_count();
 
-                if start_block + count as u64 > tracker.total_blocks() {
+                if start_block + count as u64 > max_blocks {
                     stats.out_of_bounds_blocks.fetch_add(1, Ordering::Relaxed);
                 } else if !tracker.mark_range(start_block, count) {
                     stats.duplicate_blocks.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
+    } else {
+        // Branch index nodes (Ext4ExtentIdx)
+        let idx_size = std::mem::size_of::<Ext4ExtentIdx>();
+        for i in 0..entries {
+            let offset = i * idx_size;
+            if offset + idx_size > rest.len() {
+                stats.extent_corruptions.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+
+            if let Ok((idx, _)) = Ext4ExtentIdx::ref_from_prefix(&rest[offset..]) {
+                let child_block = idx.child_block();
+                if child_block >= max_blocks {
+                    stats.out_of_bounds_blocks.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                tracker.mark_range(child_block, 1);
+
+                if let Some(child_data) = read_block_fn(child_block) {
+                    verify_extent_block(
+                        &child_data,
+                        max_blocks,
+                        tracker,
+                        stats,
+                        read_block_fn,
+                        current_depth + 1,
+                    );
+                }
+            }
+        }
     }
+}
+
+/// Discrepancy statistics when comparing on-disk bitmaps against in-memory tracker.
+#[derive(Debug, Default, Clone)]
+pub struct BitmapDiscrepancy {
+    pub false_free_blocks: u64, // Marked 0 on disk, but allocated to a file!
+    pub leaked_blocks: u64,     // Marked 1 on disk, but no file references it!
+}
+
+/// Reconciles on-disk block allocation bitmap against in-memory Roaring Bitmap.
+pub fn reconcile_block_bitmap(
+    disk_bitmap: &[u8],
+    tracker: &BlockAllocationTracker,
+    first_block_in_group: u64,
+    blocks_in_group: u32,
+) -> BitmapDiscrepancy {
+    let mut discrepancy = BitmapDiscrepancy::default();
+    let bm = tracker.bitmap.read().unwrap();
+
+    for i in 0..blocks_in_group {
+        let abs_block = first_block_in_group + i as u64;
+        let byte_idx = (i / 8) as usize;
+        let bit_idx = i % 8;
+
+        let disk_is_allocated = if byte_idx < disk_bitmap.len() {
+            (disk_bitmap[byte_idx] & (1 << bit_idx)) != 0
+        } else {
+            false
+        };
+
+        let tracker_is_allocated = if abs_block < u32::MAX as u64 {
+            bm.contains(abs_block as u32)
+        } else {
+            false
+        };
+
+        if tracker_is_allocated && !disk_is_allocated {
+            discrepancy.false_free_blocks += 1;
+        } else if !tracker_is_allocated && disk_is_allocated {
+            discrepancy.leaked_blocks += 1;
+        }
+    }
+
+    discrepancy
+}
+
+/// Directory validation and entry parser.
+pub fn verify_directory_block(block_bytes: &[u8]) -> Vec<(u32, String)> {
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    let block_len = block_bytes.len();
+
+    while offset + 8 <= block_len {
+        let header_slice = &block_bytes[offset..offset + 8];
+        let header = match Ext4DirEntry2Header::ref_from_prefix(header_slice) {
+            Ok((h, _)) => h,
+            Err(_) => break,
+        };
+
+        let rec_len = header.record_len() as usize;
+        let name_len = header.name_length() as usize;
+
+        if rec_len < 8 || offset + rec_len > block_len {
+            break;
+        }
+
+        let ino = header.inode_number();
+        if ino != 0 {
+            if header.entry_file_type() == EXT4_FT_DIR_CSUM {
+                break;
+            }
+
+            if offset + 8 + name_len <= offset + rec_len {
+                let name_bytes = &block_bytes[offset + 8..offset + 8 + name_len];
+                let name = String::from_utf8_lossy(name_bytes).to_string();
+                entries.push((ino, name));
+            }
+        }
+
+        offset += rec_len;
+    }
+
+    entries
 }

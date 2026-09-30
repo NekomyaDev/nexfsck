@@ -7,5 +7,7 @@ license.workspace = true
 
 [dependencies]
 nexfsck-core = { path = "../nexfsck-core" }
+nexfsck-io = { path = "../nexfsck-io" }
+zerocopy.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

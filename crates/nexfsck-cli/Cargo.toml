@@ -19,3 +19,4 @@ nexfsck-tui = { path = "../nexfsck-tui" }
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zerocopy.workspace = true

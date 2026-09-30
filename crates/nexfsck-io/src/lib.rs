@@ -206,6 +206,49 @@ impl BlockDevice {
         inodes
     }
 
+    /// Reads a single block at `block_nr * block_size`.
+    pub fn read_block(&self, block_nr: u64, block_size: u64) -> Result<Vec<u8>, IoError> {
+        let mut buffer = vec![0u8; block_size as usize];
+        let offset = block_nr * block_size;
+        self.read_exact_resilient(offset, &mut buffer, block_size as usize)?;
+        Ok(buffer)
+    }
+
+    /// Writes raw block data back to disk (requires read_only == false).
+    pub fn write_block(&self, block_nr: u64, block_size: u64, data: &[u8]) -> Result<(), IoError> {
+        if self.read_only {
+            return Err(IoError::StdIo(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Cannot write to device in read-only mode",
+            )));
+        }
+        let offset = block_nr * block_size;
+        self.file.write_all_at(data, offset)?;
+        Ok(())
+    }
+
+    /// Reads the block allocation bitmap for a block group.
+    pub fn read_block_bitmap(
+        &self,
+        desc: &Ext4GroupDesc,
+        is_64bit: bool,
+        block_size: u64,
+    ) -> Result<Vec<u8>, IoError> {
+        let block_nr = desc.block_bitmap(is_64bit);
+        self.read_block(block_nr, block_size)
+    }
+
+    /// Reads the inode allocation bitmap for a block group.
+    pub fn read_inode_bitmap(
+        &self,
+        desc: &Ext4GroupDesc,
+        is_64bit: bool,
+        block_size: u64,
+    ) -> Result<Vec<u8>, IoError> {
+        let block_nr = desc.inode_bitmap(is_64bit);
+        self.read_block(block_nr, block_size)
+    }
+
     pub fn path(&self) -> &str {
         &self.path
     }
