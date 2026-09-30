@@ -150,6 +150,8 @@ fn test_json_telemetry_output() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"total_block_groups\":"));
     assert!(stdout.contains("\"inodes_scanned\":"));
+    assert!(stdout.contains("\"journal_dirty\": false"));
+    assert!(stdout.contains("\"corrupt_directories\": 0"));
     assert!(stdout.contains("\"errors_detected\": 0"));
 
     let _ = std::fs::remove_file(img_path);
@@ -207,3 +209,86 @@ fn test_active_repair_false_free_block() {
     let _ = std::fs::remove_file(img_path);
     let _ = std::fs::remove_file(undo_file);
 }
+
+#[test]
+fn test_active_repair_false_free_inode() {
+    let img_path = "/tmp/test_repair_inode.img";
+    let undo_file = "/tmp/test_repair_inode.undo";
+    let _ = std::fs::remove_file(img_path);
+    let _ = std::fs::remove_file(undo_file);
+
+    // 1. Create clean ext4 filesystem
+    let _ = Command::new("truncate").args(&["-s", "32M", img_path]).status();
+    let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
+
+    // 2. Artificially clear bit 1 (inode 2) in inode bitmap (block 21 in 32M ext4)
+    let mut file = OpenOptions::new().read(true).write(true).open(img_path).unwrap();
+    file.seek(SeekFrom::Start(21 * 4096)).unwrap();
+    let mut bm_byte = [0u8; 1];
+    file.read_exact(&mut bm_byte).unwrap();
+    bm_byte[0] &= 0xFD; // clear bit 1 (inode 2, root dir)
+    file.seek(SeekFrom::Start(21 * 4096)).unwrap();
+    file.write_all(&bm_byte).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let nexfsck_bin = env!("CARGO_BIN_EXE_nexfsck");
+
+    // 3. Read-only mode must detect false-free inode error (exit code 4)
+    let verify_status = Command::new(nexfsck_bin)
+        .args(&["-n", img_path])
+        .status()
+        .unwrap();
+    assert_eq!(verify_status.code(), Some(4));
+
+    // 4. Run --repair -> must repair and return exit code 1
+    let repair_status = Command::new(nexfsck_bin)
+        .args(&["--repair", "--undo-file", undo_file, img_path])
+        .status()
+        .unwrap();
+    assert_eq!(repair_status.code(), Some(1));
+
+    // 5. Subsequent read-only check must pass cleanly (exit code 0)
+    let clean_status = Command::new(nexfsck_bin)
+        .args(&["-n", img_path])
+        .status()
+        .unwrap();
+    assert_eq!(clean_status.code(), Some(0));
+
+    // Cleanup
+    let _ = std::fs::remove_file(img_path);
+    let _ = std::fs::remove_file(undo_file);
+}
+
+#[test]
+fn test_corrupt_directory_entry_detection() {
+    let img_path = "/tmp/test_corrupt_dentry.img";
+    let _ = std::fs::remove_file(img_path);
+
+    // 1. Create clean ext4 filesystem
+    let _ = Command::new("truncate").args(&["-s", "32M", img_path]).status();
+    let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
+
+    // 2. Corrupt root directory block (block 6 at offset 24576):
+    // Inject invalid unaligned rec_len (e.g. 5 bytes instead of 12) at offset 24576 + 4
+    let mut file = OpenOptions::new().read(true).write(true).open(img_path).unwrap();
+    file.seek(SeekFrom::Start(6 * 4096 + 4)).unwrap();
+    let bad_rec_len = [0x05u8, 0x00u8]; // Invalid unaligned record length
+    file.write_all(&bad_rec_len).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let nexfsck_bin = env!("CARGO_BIN_EXE_nexfsck");
+
+    // 3. Read-only verification must detect directory corruption and exit with code 4
+    let verify_status = Command::new(nexfsck_bin)
+        .args(&["-n", img_path])
+        .status()
+        .unwrap();
+    assert_eq!(verify_status.code(), Some(4));
+
+    // Cleanup
+    let _ = std::fs::remove_file(img_path);
+}
+
+

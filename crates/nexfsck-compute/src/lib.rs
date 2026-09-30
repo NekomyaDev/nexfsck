@@ -103,6 +103,7 @@ pub struct InodeVerificationStats {
     pub duplicate_blocks: AtomicU64,
     pub out_of_bounds_blocks: AtomicU64,
     pub extent_corruptions: AtomicU64,
+    pub corrupt_directories: AtomicU64,
 }
 
 impl InodeVerificationStats {
@@ -380,9 +381,19 @@ pub fn reconcile_block_bitmap(
     discrepancy
 }
 
-/// Directory validation and entry parser.
-pub fn verify_directory_block(block_bytes: &[u8]) -> Vec<(u32, String)> {
-    let mut entries = Vec::new();
+/// Result of directory block validation.
+#[derive(Debug, Default, Clone)]
+pub struct DirectoryValidationResult {
+    pub entries: Vec<(u32, String)>,
+    pub corrupt_entries: u64,
+}
+
+/// Validates directory block entries against alignment, name integrity, and inode boundary.
+pub fn verify_directory_block_detailed(
+    block_bytes: &[u8],
+    max_inodes: u32,
+) -> DirectoryValidationResult {
+    let mut res = DirectoryValidationResult::default();
     let mut offset = 0;
     let block_len = block_bytes.len();
 
@@ -390,13 +401,17 @@ pub fn verify_directory_block(block_bytes: &[u8]) -> Vec<(u32, String)> {
         let header_slice = &block_bytes[offset..offset + 8];
         let header = match Ext4DirEntry2Header::ref_from_prefix(header_slice) {
             Ok((h, _)) => h,
-            Err(_) => break,
+            Err(_) => {
+                res.corrupt_entries += 1;
+                break;
+            }
         };
 
         let rec_len = header.record_len() as usize;
         let name_len = header.name_length() as usize;
 
-        if rec_len < 8 || offset + rec_len > block_len {
+        if rec_len < 8 || rec_len % 4 != 0 || offset + rec_len > block_len {
+            res.corrupt_entries += 1;
             break;
         }
 
@@ -406,15 +421,29 @@ pub fn verify_directory_block(block_bytes: &[u8]) -> Vec<(u32, String)> {
                 break;
             }
 
-            if offset + 8 + name_len <= offset + rec_len {
+            if ino > max_inodes {
+                res.corrupt_entries += 1;
+            } else if offset + 8 + name_len <= offset + rec_len {
                 let name_bytes = &block_bytes[offset + 8..offset + 8 + name_len];
-                let name = String::from_utf8_lossy(name_bytes).to_string();
-                entries.push((ino, name));
+                if name_len == 0 || name_bytes.contains(&b'/') || name_bytes.contains(&0) {
+                    res.corrupt_entries += 1;
+                } else {
+                    let name = String::from_utf8_lossy(name_bytes).to_string();
+                    res.entries.push((ino, name));
+                }
+            } else {
+                res.corrupt_entries += 1;
             }
         }
 
         offset += rec_len;
     }
 
-    entries
+    res
 }
+
+/// Directory validation and entry parser (backwards compatibility wrapper).
+pub fn verify_directory_block(block_bytes: &[u8]) -> Vec<(u32, String)> {
+    verify_directory_block_detailed(block_bytes, u32::MAX).entries
+}
+

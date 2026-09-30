@@ -104,9 +104,25 @@ cd nexfsck
 
 # Build all workspace crates in release mode
 cargo build --release
+```
 
-# Run verification in read-only analysis mode
-./target/release/nexfsck --read-only /dev/nvme0n1p1
+### CLI Usage Examples
+
+```bash
+# Safe read-only analysis mode (default, exit code 0 if clean, 4 if errors found)
+./target/release/nexfsck -n /dev/nvme0n1p1
+
+# Active repair with atomic undo journal creation (exit code 1 on success)
+./target/release/nexfsck --repair --undo-file /var/log/rollback.undo /dev/nvme0n1p1
+
+# 1-Click atomic rollback from undo journal (restores pre-repair physical blocks)
+./target/release/nexfsck --rollback --undo-file /var/log/rollback.undo /dev/nvme0n1p1
+
+# Rescue filesystem when primary superblock is damaged using backup superblock hunter
+./target/release/nexfsck --backup-sb 32768 /dev/nvme0n1p1
+
+# Machine-readable JSON telemetry output for monitoring and orchestration
+./target/release/nexfsck --json -n /dev/nvme0n1p1
 ```
 
 ---

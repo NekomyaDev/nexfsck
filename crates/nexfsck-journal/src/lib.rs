@@ -8,6 +8,7 @@ use std::path::Path;
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use nexfsck_core::{Ext4Extent, Ext4GroupDesc, Ext4Superblock};
 use nexfsck_io::BlockDevice;
 
 pub const UNDO_MAGIC: u32 = 0x554E444F; // "UNDO"
@@ -197,3 +198,44 @@ impl AtomicUndoJournal {
         self.entries.len()
     }
 }
+
+/// Inspects the JBD2 journal from the filesystem if present.
+pub fn inspect_journal(
+    dev: &BlockDevice,
+    sb: &Ext4Superblock,
+    descriptors: &[Ext4GroupDesc],
+    is_64bit: bool,
+) -> Result<Option<Jbd2Superblock>, JournalError> {
+    let journal_inum = u32::from_le(sb.s_journal_inum);
+    if journal_inum == 0 || descriptors.is_empty() {
+        return Ok(None);
+    }
+
+    // Inode 8 is in block group 0
+    let desc0 = &descriptors[0];
+    let inode_table = dev.read_inode_table(sb, desc0, is_64bit)?;
+    let inodes = BlockDevice::parse_inodes_from_table(&inode_table, sb.inode_size() as usize);
+
+    let idx = (journal_inum - 1) as usize;
+    if idx >= inodes.len() {
+        return Ok(None);
+    }
+
+    let journal_inode = &inodes[idx];
+    if !journal_inode.is_used() || !journal_inode.uses_extents() {
+        return Ok(None);
+    }
+
+    if let Ok((ext, _)) = Ext4Extent::ref_from_prefix(&journal_inode.i_block[12..]) {
+        let first_block = ext.physical_start();
+        let block_bytes = dev.read_block(first_block, sb.block_size())?;
+        if let Ok((jbd_sb, _)) = Jbd2Superblock::ref_from_prefix(&block_bytes) {
+            if jbd_sb.verify_magic().is_ok() {
+                return Ok(Some(*jbd_sb));
+            }
+        }
+    }
+
+    Ok(None)
+}
+

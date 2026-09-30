@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 use zerocopy::FromBytes;
 
 use nexfsck_compute::{
-    reconcile_block_bitmap, reconcile_inode_bitmap, verify_directory_block,
+    reconcile_block_bitmap, reconcile_inode_bitmap, verify_directory_block_detailed,
     verify_inodes_parallel, BitmapDiscrepancy, BlockAllocationTracker, HardwareProfile,
     InodeBitmapDiscrepancy, InodeVerificationStats,
 };
@@ -210,6 +210,24 @@ fn main() -> ExitCode {
         }
     };
 
+    // JBD2 Crash Recovery Journal Inspection
+    let mut journal_is_dirty = false;
+    if let Ok(Some(jbd)) = nexfsck_journal::inspect_journal(&dev, &sb, &group_descriptors, is_64bit) {
+        let is_dirty = !jbd.is_clean() || sb.has_incompat_feature(nexfsck_core::EXT4_FEATURE_INCOMPAT_RECOVER);
+        journal_is_dirty = is_dirty;
+        if !args.json {
+            info!(
+                "JBD2 Journal Active | Seq: {} | Block Size: {}B | Clean: {}",
+                jbd.sequence(),
+                jbd.block_size(),
+                !is_dirty
+            );
+        }
+        if is_dirty {
+            warn!("Filesystem journal is DIRTY: uncommitted or pending transactions exist.");
+        }
+    }
+
     // 5. Initialize In-Memory Roaring Bitmaps & Telemetry
     let tracker = BlockAllocationTracker::new(total_blocks);
     let inode_stats = InodeVerificationStats::new();
@@ -301,12 +319,16 @@ fn main() -> ExitCode {
     let mut total_dentry_count = 0;
     for dir_block in directory_blocks_to_check {
         if let Ok(block_bytes) = dev.read_block(dir_block, block_size) {
-            let entries = verify_directory_block(&block_bytes);
-            total_dentry_count += entries.len();
+            let res = verify_directory_block_detailed(&block_bytes, sb.total_inodes());
+            total_dentry_count += res.entries.len();
+            if res.corrupt_entries > 0 {
+                inode_stats.corrupt_directories.fetch_add(res.corrupt_entries, Ordering::Relaxed);
+            }
         }
     }
+    let corrupt_dirs = inode_stats.corrupt_directories.load(Ordering::Relaxed);
     if !args.json {
-        info!("Pass 2: Validated {} directory entries.", total_dentry_count);
+        info!("Pass 2: Validated {} directory entries (corrupted entries: {}).", total_dentry_count, corrupt_dirs);
     }
 
     // Pass 5: Block & Inode Allocation Bitmap Reconciliation
@@ -347,47 +369,82 @@ fn main() -> ExitCode {
     let fast_symlinks = inode_stats.fast_symlinks_checked.load(Ordering::Relaxed);
     let corrupt_symlinks = inode_stats.corrupted_symlinks.load(Ordering::Relaxed);
 
-    stats.errors_found += corruptions + duplicates + oob + corrupt_symlinks + total_block_discrepancy.false_free_blocks + total_inode_discrepancy.false_free_inodes;
+    stats.errors_found += corruptions + duplicates + oob + corrupt_symlinks + corrupt_dirs + total_block_discrepancy.false_free_blocks + total_inode_discrepancy.false_free_inodes;
 
     // 6. Active Repair Mode Execution
     let mut errors_were_corrected = false;
-    if args.repair && total_block_discrepancy.false_free_blocks > 0 {
-        info!("Active Repair Mode: Correcting false-free block allocation bitmaps...");
+    let has_repairable_errors = total_block_discrepancy.false_free_blocks > 0 || total_inode_discrepancy.false_free_inodes > 0;
+    if args.repair && has_repairable_errors {
+        info!("Active Repair Mode: Correcting false-free bitmaps with atomic undo journal...");
         if let Ok(mut undo_journal) = AtomicUndoJournal::new(Some(&args.undo_file), block_size as u32) {
-            for (bg_idx, desc) in group_descriptors.iter().enumerate() {
-                if desc.is_block_uninit() {
-                    continue;
-                }
-                let first_block = (bg_idx as u64) * (blocks_per_group as u64) + (u32::from_le(sb.s_first_data_block) as u64);
-                if first_block >= total_blocks {
-                    break;
-                }
-                let blocks_in_this_group = (total_blocks - first_block).min(blocks_per_group as u64) as u32;
+            // Repair Block Bitmaps
+            if total_block_discrepancy.false_free_blocks > 0 {
+                for (bg_idx, desc) in group_descriptors.iter().enumerate() {
+                    if desc.is_block_uninit() {
+                        continue;
+                    }
+                    let first_block = (bg_idx as u64) * (blocks_per_group as u64) + first_data_block;
+                    if first_block >= total_blocks {
+                        break;
+                    }
+                    let blocks_in_this_group = (total_blocks - first_block).min(blocks_per_group as u64) as u32;
 
-                if let Ok(mut disk_bm) = dev.read_block_bitmap(desc, is_64bit, block_size) {
-                    let mut modified = false;
-                    for i in 0..blocks_in_this_group {
-                        let abs_block = first_block + i as u64;
-                        if tracker.is_allocated(abs_block) {
-                            let byte_idx = (i / 8) as usize;
-                            let bit_idx = i % 8;
-                            if byte_idx < disk_bm.len() && (disk_bm[byte_idx] & (1 << bit_idx)) == 0 {
-                                disk_bm[byte_idx] |= 1 << bit_idx;
-                                modified = true;
+                    if let Ok(mut disk_bm) = dev.read_block_bitmap(desc, is_64bit, block_size) {
+                        let mut modified = false;
+                        for i in 0..blocks_in_this_group {
+                            let abs_block = first_block + i as u64;
+                            if tracker.is_allocated(abs_block) {
+                                let byte_idx = (i / 8) as usize;
+                                let bit_idx = i % 8;
+                                if byte_idx < disk_bm.len() && (disk_bm[byte_idx] & (1 << bit_idx)) == 0 {
+                                    disk_bm[byte_idx] |= 1 << bit_idx;
+                                    modified = true;
+                                }
                             }
                         }
-                    }
 
-                    if modified {
-                        let orig_bm = dev.read_block_bitmap(desc, is_64bit, block_size).unwrap_or_default();
-                        let _ = undo_journal.record_mutation(desc.block_bitmap(is_64bit), &orig_bm);
-                        if dev.write_block(desc.block_bitmap(is_64bit), block_size, &disk_bm).is_ok() {
-                            debug!("Repaired block bitmap for group {}", bg_idx);
-                            errors_were_corrected = true;
+                        if modified {
+                            let orig_bm = dev.read_block_bitmap(desc, is_64bit, block_size).unwrap_or_default();
+                            let _ = undo_journal.record_mutation(desc.block_bitmap(is_64bit), &orig_bm);
+                            if dev.write_block(desc.block_bitmap(is_64bit), block_size, &disk_bm).is_ok() {
+                                debug!("Repaired block bitmap for group {}", bg_idx);
+                                errors_were_corrected = true;
+                            }
                         }
                     }
                 }
             }
+
+            // Repair Inode Bitmaps
+            if total_inode_discrepancy.false_free_inodes > 0 {
+                for (bg_idx, desc) in group_descriptors.iter().enumerate() {
+                    if let Some((_, inodes)) = all_scanned_inodes.iter().find(|(idx, _)| *idx == bg_idx) {
+                        if let Ok(mut disk_inomb) = dev.read_inode_bitmap(desc, is_64bit, block_size) {
+                            let mut modified = false;
+                            for (i, inode) in inodes.iter().enumerate() {
+                                if inode.is_used() {
+                                    let byte_idx = i / 8;
+                                    let bit_idx = i % 8;
+                                    if byte_idx < disk_inomb.len() && (disk_inomb[byte_idx] & (1 << bit_idx)) == 0 {
+                                        disk_inomb[byte_idx] |= 1 << bit_idx;
+                                        modified = true;
+                                    }
+                                }
+                            }
+
+                            if modified {
+                                let orig_inomb = dev.read_inode_bitmap(desc, is_64bit, block_size).unwrap_or_default();
+                                let _ = undo_journal.record_mutation(desc.inode_bitmap(is_64bit), &orig_inomb);
+                                if dev.write_block(desc.inode_bitmap(is_64bit), block_size, &disk_inomb).is_ok() {
+                                    debug!("Repaired inode bitmap for group {}", bg_idx);
+                                    errors_were_corrected = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let _ = dev.flush_kernel_buffers();
             info!("Repairs committed to disk with atomic undo journal: {}", args.undo_file);
         }
@@ -407,6 +464,7 @@ fn main() -> ExitCode {
         println!("  \"extent_trees_validated\": {},", inode_stats.extent_trees_checked.load(Ordering::Relaxed));
         println!("  \"allocated_blocks\": {},", tracker.allocated_count());
         println!("  \"directory_entries\": {},", total_dentry_count);
+        println!("  \"corrupt_directories\": {},", corrupt_dirs);
         println!("  \"extent_corruptions\": {},", corruptions);
         println!("  \"duplicate_blocks\": {},", duplicates);
         println!("  \"out_of_bounds_blocks\": {},", oob);
@@ -414,6 +472,7 @@ fn main() -> ExitCode {
         println!("  \"leaked_blocks\": {},", total_block_discrepancy.leaked_blocks);
         println!("  \"false_free_inodes\": {},", total_inode_discrepancy.false_free_inodes);
         println!("  \"leaked_inodes\": {},", total_inode_discrepancy.leaked_inodes);
+        println!("  \"journal_dirty\": {},", journal_is_dirty);
         println!("  \"errors_detected\": {},", stats.errors_found);
         println!("  \"errors_corrected\": {},", errors_were_corrected);
         println!("  \"elapsed_seconds\": {:.4}", stats.elapsed_secs());
@@ -455,6 +514,7 @@ fn main() -> ExitCode {
             tracker.allocated_count()
         );
         println!("Directory Entries  : {}", total_dentry_count);
+        println!("Corrupt Directories: {}", corrupt_dirs);
         println!("Extent Corruptions : {}", corruptions);
         println!("Duplicate Blocks   : {}", duplicates);
         println!("Out-of-Bounds Blks : {}", oob);
@@ -463,6 +523,7 @@ fn main() -> ExitCode {
         println!("Leaked Blocks      : {}", total_block_discrepancy.leaked_blocks);
         println!("False-Free Inodes  : {}", total_inode_discrepancy.false_free_inodes);
         println!("Leaked Inodes      : {}", total_inode_discrepancy.leaked_inodes);
+        println!("Journal Dirty      : {}", journal_is_dirty);
         println!("--------------------------------------------------");
 
         if errors_were_corrected {
