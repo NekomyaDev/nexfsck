@@ -9,9 +9,13 @@ Performs:
 """
 
 import concurrent.futures
+import datetime
+import json
 import os
+import platform
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -21,6 +25,18 @@ MNT_PATH = "/tmp/stress_mnt"
 UNDO_LOG = "/tmp/stress_10g_repair.undo"
 CORRUPT_IMG = "/tmp/stress_10g_corrupt.img"
 NEXFSCK_BIN = "/home/pop-os/nexfsck/target/release/nexfsck"
+RESULT_DIR = "/home/pop-os/nexfsck/benchmark-results"
+RESULT_JSON = f"{RESULT_DIR}/latest.json"
+COMPARISON_RUNS = 10
+
+def percentile(values, fraction):
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, max(0, int(len(ordered) * fraction + 0.999999) - 1))]
+
+def timed_run(command):
+    started = time.perf_counter()
+    proc = subprocess.run(command, capture_output=True, text=True)
+    return proc, time.perf_counter() - started
 
 def populate_filesystem():
     print("=" * 70)
@@ -35,7 +51,9 @@ def populate_filesystem():
         os.remove(IMG_PATH)
 
     print(f"Creating 10.0 GiB image at {IMG_PATH}...")
-    subprocess.check_call(["fallocate", "-l", "10G", IMG_PATH])
+    # Sparse creation keeps the 10 GiB logical geometry while allowing a clean
+    # and a corrupted copy to coexist on the 16 GiB live-USB tmpfs.
+    subprocess.check_call(["truncate", "-s", "10G", IMG_PATH])
     subprocess.check_call(["mkfs.ext4", "-F", "-b", "4096", "-O", "64bit,dir_index,extents", IMG_PATH])
     
     print("Mounting loop device...")
@@ -109,13 +127,28 @@ def run_ground_truth_test():
     print("STAGE 2: 10.0 GiB GROUND-TRUTH CONSISTENCY & ACCURACY VERIFICATION")
     print("=" * 70)
     
-    # Run e2fsck in a comparable read-only mode
-    print("Running e2fsck v1.46.5 (Standard fsck) on 10.0 GiB storage...")
-    t0 = time.time()
-    p_e2 = subprocess.run(["e2fsck", "-f", "-v", "-t", "-n", IMG_PATH], capture_output=True, text=True)
-    t_e2 = time.time() - t0
-    
-    print(f"e2fsck finished in {t_e2:.3f}s (Exit code: {p_e2.returncode})")
+    print(f"Running {COMPARISON_RUNS} interleaved warm-cache repetitions per checker...")
+    e2_times = []
+    nex_times = []
+    p_e2 = None
+    p_nex = None
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    for run in range(1, COMPARISON_RUNS + 1):
+        p_e2, e2_elapsed = timed_run(["e2fsck", "-f", "-v", "-t", "-n", IMG_PATH])
+        p_nex, nex_elapsed = timed_run([NEXFSCK_BIN, "-n", IMG_PATH])
+        assert p_e2.returncode == 0, f"e2fsck comparison run {run} failed"
+        assert p_nex.returncode == 0, f"nexfsck comparison run {run} failed"
+        e2_times.append(e2_elapsed)
+        nex_times.append(nex_elapsed)
+        print(f"  [Run {run:02d}/{COMPARISON_RUNS}] e2fsck={e2_elapsed:.3f}s nexfsck={nex_elapsed:.3f}s")
+    with open(f"{RESULT_DIR}/e2fsck.stdout.log", "w") as f:
+        f.write(p_e2.stdout)
+    with open(f"{RESULT_DIR}/e2fsck.stderr.log", "w") as f:
+        f.write(p_e2.stderr)
+    with open(f"{RESULT_DIR}/nexfsck.stdout.log", "w") as f:
+        f.write(p_nex.stdout)
+    with open(f"{RESULT_DIR}/nexfsck.stderr.log", "w") as f:
+        f.write(p_nex.stderr)
     
     e2_inodes = 0
     e2_blocks = 0
@@ -132,14 +165,6 @@ def run_ground_truth_test():
             if m: e2_files = int(m.group(1))
             
     print(f"e2fsck ground truth: Inodes={e2_inodes}, Blocks={e2_blocks}, Files={e2_files}")
-    
-    # Run nexfsck
-    print("\nRunning nexfsck v0.1.0 (runtime output records active I/O and compute backends)...")
-    t0 = time.time()
-    p_nex = subprocess.run([NEXFSCK_BIN, "-n", IMG_PATH], capture_output=True, text=True)
-    t_nex = time.time() - t0
-    
-    print(f"nexfsck finished in {t_nex:.3f}s (Exit code: {p_nex.returncode})")
     
     nex_inodes = 0
     nex_blocks = 0
@@ -162,18 +187,37 @@ def run_ground_truth_test():
     print(f"nexfsck ground truth: Inodes={nex_inodes}, Blocks={nex_blocks}, Entries={nex_entries}, Errors={nex_errors}")
     
     # Compare
-    speedup = t_e2 / t_nex if t_nex > 0 else 1.0
+    e2_median = statistics.median(e2_times)
+    nex_median = statistics.median(nex_times)
+    speedup = e2_median / nex_median if nex_median > 0 else 1.0
     print("-" * 70)
-    print(f"SPEED COMPARISON: e2fsck={t_e2:.3f}s vs nexfsck={t_nex:.3f}s -> {speedup:.1f}x SPEEDUP!")
+    print(f"MEDIAN COMPARISON: e2fsck={e2_median:.3f}s vs nexfsck={nex_median:.3f}s -> {speedup:.2f}x")
     print(f"BLOCK PARITY    : e2fsck={e2_blocks} vs nexfsck={nex_blocks} -> MATCH: {e2_blocks == nex_blocks}")
     print(f"INODE PARITY    : e2fsck={e2_inodes} vs nexfsck active={nex_inodes} -> MATCH: {abs(e2_inodes - nex_inodes) < 25}")
     print(f"CLEAN CHECK     : nexfsck Errors={nex_errors} (selected counters only; not bit-exact parity)")
     print("-" * 70)
     
-    assert p_e2.returncode == 0, "e2fsck failed"
-    assert p_nex.returncode == 0, "nexfsck failed"
     assert e2_blocks == nex_blocks, f"Block count mismatch: {e2_blocks} != {nex_blocks}"
     assert nex_errors == 0, f"nexfsck reported errors on clean filesystem: {nex_errors}"
+    return {
+        "runs": COMPARISON_RUNS,
+        "cache_policy": "interleaved warm-cache; no global cache drop",
+        "e2fsck_seconds": e2_times,
+        "nexfsck_seconds": nex_times,
+        "e2fsck_median_seconds": e2_median,
+        "nexfsck_median_seconds": nex_median,
+        "e2fsck_p95_seconds": percentile(e2_times, 0.95),
+        "nexfsck_p95_seconds": percentile(nex_times, 0.95),
+        "e2fsck_stddev_seconds": statistics.pstdev(e2_times),
+        "nexfsck_stddev_seconds": statistics.pstdev(nex_times),
+        "median_ratio": speedup,
+        "e2fsck_inodes": e2_inodes,
+        "e2fsck_blocks": e2_blocks,
+        "nexfsck_active_inodes": nex_inodes,
+        "nexfsck_allocated_blocks": nex_blocks,
+        "nexfsck_directory_entries": nex_entries,
+        "nexfsck_errors": nex_errors,
+    }
 
 def run_endurance_stress_test():
     print("\n" + "=" * 70)
@@ -216,8 +260,15 @@ def run_endurance_stress_test():
     print(f"ENDURANCE SUMMARY (10.0 GiB):")
     print(f"  Total Passes Completed : 30 / 30 Clean Passes (100% Success)")
     print(f"  Average Execution Time : {avg_time:.3f} seconds / pass")
-    print(f"  Peak Resident Memory   : Min {min_rss:.2f} MiB -> Max {max_rss:.2f} MiB (Zero Leaks Across 80 Groups)")
+    print(f"  Peak Resident Memory   : Min {min_rss:.2f} MiB -> Max {max_rss:.2f} MiB (observed range)")
     print("-" * 70)
+    return {
+        "passes": len(times),
+        "seconds": times,
+        "average_seconds": avg_time,
+        "min_rss_mib": min_rss,
+        "max_rss_mib": max_rss,
+    }
 
 def run_fuzzing_and_repair_test():
     print("\n" + "=" * 70)
@@ -225,7 +276,7 @@ def run_fuzzing_and_repair_test():
     print("=" * 70)
     
     # Never mutate the clean benchmark fixture.
-    shutil.copyfile(IMG_PATH, CORRUPT_IMG)
+    subprocess.check_call(["cp", "--sparse=always", IMG_PATH, CORRUPT_IMG])
     block_groups_info = subprocess.check_output(["dumpe2fs", CORRUPT_IMG], stderr=subprocess.DEVNULL).decode()
     
     bm_blocks = []
@@ -312,11 +363,21 @@ def run_fuzzing_and_repair_test():
     pE = subprocess.run([NEXFSCK_BIN, "-n", CORRUPT_IMG], capture_output=True, text=True)
     print(f"  nexfsck exit code: {pE.returncode} (Expected: 4)")
     assert pE.returncode == 4, f"Expected exit code 4, got {pE.returncode}"
-    print("  ✔ Exact bit-level state restored from undo journal on 10.0 GiB storage!")
+    print("  ✔ Injected bitmap corruption was restored from the undo journal.")
     
     # Final cleanup of undo log
     if os.path.exists(UNDO_LOG):
         os.remove(UNDO_LOG)
+    return {
+        "block_bitmap_group": 0,
+        "inode_bitmap_group": target_bg,
+        "detection_exit": pA.returncode,
+        "repair_exit": pB.returncode,
+        "post_repair_exit": pC.returncode,
+        "rollback_exit": pD.returncode,
+        "restored_corruption_exit": pE.returncode,
+        "undo_bytes": undo_size,
+    }
 
 def main():
     print("=" * 70)
@@ -326,12 +387,42 @@ def main():
     
     try:
         populate_filesystem()
-        run_ground_truth_test()
-        run_endurance_stress_test()
-        run_fuzzing_and_repair_test()
+        comparison = run_ground_truth_test()
+        endurance = run_endurance_stress_test()
+        repair = run_fuzzing_and_repair_test()
+        result = {
+            "schema_version": 1,
+            "generated_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd="/home/pop-os/nexfsck", text=True).strip(),
+            "fixture": {
+                "logical_bytes": os.path.getsize(IMG_PATH),
+                "logical_gib": os.path.getsize(IMG_PATH) / (1024 ** 3),
+                "sparse": True,
+                "files_generated": 100000,
+                "symlinks_requested": 2000,
+                "hardlinks_requested": 1000,
+                "block_size": 4096,
+            },
+            "environment": {
+                "kernel": platform.release(),
+                "machine": platform.machine(),
+                "cpu": next((line.split(":", 1)[1].strip() for line in subprocess.check_output(["lscpu"], text=True).splitlines() if line.startswith("Model name:")), platform.processor()),
+                "memory_gib": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3), 2),
+                "fixture_storage": "/tmp tmpfs (memory-backed live-USB environment)",
+                "e2fsck_version": subprocess.run(["e2fsck", "-V"], capture_output=True, text=True).stderr.strip(),
+                "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
+            },
+            "comparison": comparison,
+            "endurance": endurance,
+            "repair_rollback": repair,
+        }
+        with open(RESULT_JSON, "w") as f:
+            json.dump(result, f, indent=2)
+            f.write("\n")
+        print(f"Raw benchmark result written to {RESULT_JSON}")
         
         print("\n" + "=" * 70)
-        print("🎉 10.0 GiB STRESS TESTS & BENCHMARKS PASSED FLAWLESSLY WITH ZERO DEFECTS!")
+        print("10.0 GiB benchmark and defined stress assertions completed successfully.")
         print("=" * 70)
     finally:
         if os.path.exists(IMG_PATH):

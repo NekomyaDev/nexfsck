@@ -1,0 +1,27 @@
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+
+      112305 inodes used (17.14%, out of 655360)
+          43 non-contiguous files (0.0%)
+         204 non-contiguous directories (0.2%)
+             # of inodes with ind/dind/tind blocks: 0/0/0
+             Extent depth histogram: 109607/5
+     1182218 blocks used (45.10%, out of 2621440)
+           0 bad blocks
+           1 large file
+
+      107941 regular files
+        1575 directories
+           0 character device files
+           0 block device files
+           0 fifos
+        1000 links
+        2780 symbolic links (2685 fast symbolic links)
+           0 sockets
+------------
+      113296 files
+Memory used: 836k/0k (96k/741k), time:  0.13/ 0.11/ 0.01
+I/O read: 54MB, write: 0MB, rate: 430.86MB/s

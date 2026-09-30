@@ -31,6 +31,12 @@ The historical 1 GiB `0.28 s` versus `0.02 s` result and its `14x`, RTX 4060, an
 
 New performance claims must include the fixture-generation command, CPU, RAM, storage, kernel, tool versions and flags, cache policy, thread count, active I/O backend, sample count, and variance. GPU acceleration may only be claimed when a compute backend exists and the benchmark records that it executed. See [`docs/benchmarking.md`](docs/benchmarking.md).
 
+### Latest measured 10 GiB run
+
+On the committed 10 GiB sparse fixture (100,000 generated files, 80 block groups, `/tmp` tmpfs), 10 interleaved warm-cache repetitions measured median wall times of **0.127 s for e2fsck** and **0.374 s for nexfsck**. In this specific run e2fsck was about **2.95× faster**. Both reported 1,182,218 allocated blocks; nexfsck reported zero errors. Nexfsck also completed 30/30 endurance passes with observed peak RSS between 131.61 and 132.48 MiB, followed by successful corruption detection, repair, verification, rollback, and restored-corruption detection.
+
+These are environment-specific selected-counter results, not bit-exact parity or production-storage performance. The fixture was memory-backed and cache was not globally dropped. See the machine-readable [`benchmark-results/latest.json`](benchmark-results/latest.json), raw logs in [`benchmark-results`](benchmark-results), and the reproducible runner [`scripts/stress_benchmark.py`](scripts/stress_benchmark.py).
+
 ## Workspace architecture
 
 - [`crates/nexfsck-core`](crates/nexfsck-core): ext4 on-disk structures and POD parsing.

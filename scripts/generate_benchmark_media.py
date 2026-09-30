@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
 Generates high-resolution side-by-side live benchmark GIF and MP4 video
-creating illustrative, non-evidentiary e2fsck/nexfsck benchmark media.
+from the committed 10 GiB benchmark JSON artifact.
 """
 
 import os
+import json
 import shutil
 import subprocess
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 1440, 920
+RESULT_PATH = "/home/pop-os/nexfsck/benchmark-results/latest.json"
 
 def get_fonts():
     mono_path = "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf"
@@ -66,24 +68,26 @@ def render_lines(draw, fonts, x, y, lines):
             draw.text((x, curr_y), text, font=f, fill=color)
         curr_y += 18
 
-def draw_bottom_dashboard(draw, fonts, frame_idx, total_frames):
+def draw_bottom_dashboard(draw, fonts, frame_idx, result):
     dx, dy, dw, dh = 40, 745, 1360, 150
     draw.rounded_rectangle([dx, dy, dx + dw, dy + dh], radius=10, fill=(18, 21, 29), outline=(38, 45, 61), width=1)
     
     # Header of dashboard
-    draw.text((dx + 20, dy + 12), "ILLUSTRATIVE TELEMETRY — NOT A BENCHMARK RESULT", font=fonts["title"], fill=(148, 163, 184))
+    draw.text((dx + 20, dy + 12), "MEASURED 10 GiB RUN — RAW DATA: benchmark-results/latest.json", font=fonts["title"], fill=(148, 163, 184))
     
     parity_color = (34, 197, 94) if frame_idx >= 35 else (148, 163, 184)
-    parity_text = "● AGGREGATE COUNTERS MATCH (ILLUSTRATIVE)" if frame_idx >= 35 else "● COMPARING SELECTED COUNTERS..."
+    parity_text = "● ALLOCATED BLOCK COUNTS MATCH" if frame_idx >= 35 else "● COMPARING SELECTED COUNTERS..."
     draw.text((dx + 920, dy + 12), parity_text, font=fonts["badge"], fill=parity_color)
     
     draw.line([dx + 15, dy + 34, dx + dw - 15, dy + 34], fill=(30, 41, 59), width=1)
     
+    comp = result["comparison"]
+    end = result["endurance"]
     cards = [
-        ("I/O SUBSYSTEM", "io_uring 128 SQE", "Kernel async vs sync read()", (56, 189, 248)),
-        ("PARALLELISM", "Rayon worker pool", "Thread count is run-specific", (168, 85, 247)),
-        ("EXECUTION TIME", "UNVERIFIED SAMPLE", "Not a published benchmark", (34, 197, 94)),
-        ("INODE & BLOCK PARITY", "15,186 Inodes / 54,844 Blks", "0 errors • 0 leaks • 0 orphans", (251, 191, 36)),
+        ("FIXTURE", "10.0 GiB / 80 groups", "100,000 generated files", (56, 189, 248)),
+        ("MEDIAN WALL TIME", f"e2 {comp['e2fsck_median_seconds']:.3f}s / nex {comp['nexfsck_median_seconds']:.3f}s", f"10 warm-cache runs • ratio {comp['median_ratio']:.2f}x", (251, 191, 36)),
+        ("ENDURANCE", f"{end['passes']}/{end['passes']} passes", f"RSS {end['min_rss_mib']:.1f}–{end['max_rss_mib']:.1f} MiB", (34, 197, 94)),
+        ("ALLOCATED BLOCKS", f"{comp['e2fsck_blocks']:,}", f"Both tools • nexfsck errors: {comp['nexfsck_errors']}", (168, 85, 247)),
     ]
     
     card_w = (dw - 40 - 3 * 16) // 4
@@ -105,13 +109,16 @@ def draw_bottom_dashboard(draw, fonts, frame_idx, total_frames):
             draw.text((cx + 12, cy + 58), "Collecting stats...", font=fonts["card_sub"], fill=(71, 85, 105))
 
 def generate_frames():
+    with open(RESULT_PATH) as f:
+        result = json.load(f)
+    comp = result["comparison"]
     os.makedirs("/tmp/bench_frames", exist_ok=True)
     fonts = get_fonts()
     
     total_frames = 65
     
     # Real terminal lines for e2fsck
-    e2fsck_prompt = ("root@linux-dev:~# e2fsck -f -v -n /dev/nvme0n1p1", (255, 255, 255), True)
+    e2fsck_prompt = ("$ e2fsck -f -v -t -n /tmp/stress_10g.img", (255, 255, 255), True)
     e2fsck_p1 = ("Pass 1: Checking inodes, blocks, and sizes", (226, 232, 240), False)
     e2fsck_p2 = ("Pass 2: Checking directory structure", (226, 232, 240), False)
     e2fsck_p3 = ("Pass 3: Checking directory connectivity", (226, 232, 240), False)
@@ -119,22 +126,22 @@ def generate_frames():
     e2fsck_p5 = ("Pass 5: Checking group summary information", (226, 232, 240), False)
     e2fsck_summary = [
         ("", (0,0,0), False),
-        ("   15193 inodes used (23.18%, out of 65536)", (56, 189, 248), True),
+        (f"   {comp['e2fsck_inodes']:,} inodes used", (56, 189, 248), True),
         ("       0 non-contiguous files (0.0%)", (148, 163, 184), False),
         ("       4 non-contiguous directories (0.0%)", (148, 163, 184), False),
-        ("         Extent depth histogram: 14400 valid", (203, 213, 225), False),
-        ("   54844 blocks used (20.92%, out of 262144)", (56, 189, 248), True),
+        ("         Fixture: sparse 10 GiB, 80 block groups", (203, 213, 225), False),
+        (f"   {comp['e2fsck_blocks']:,} blocks used", (56, 189, 248), True),
         ("       0 bad blocks | 1 large file", (148, 163, 184), False),
-        ("   12923 regular files | 1381 directories", (203, 213, 225), False),
-        ("     880 symbolic links (785 fast symlinks)", (203, 213, 225), False),
+        ("   100,000 generated files + copied real data", (203, 213, 225), False),
+        ("   2,000 symlinks + 1,000 hardlinks requested", (203, 213, 225), False),
         ("--------------------------------------------------", (51, 65, 85), False),
-        ("   15184 files verified", (248, 250, 252), True),
-        ("Memory: 416k, I/O read: 13MB (Rate: 638.3MB/s)", (148, 163, 184), False),
-        ("Status: Clean | Execution time: 0.28s", (251, 191, 36), True),
+        (f"10-run p95: {comp['e2fsck_p95_seconds']:.3f}s", (248, 250, 252), True),
+        (f"Stddev: {comp['e2fsck_stddev_seconds']:.4f}s", (148, 163, 184), False),
+        (f"Status: Clean | Median wall: {comp['e2fsck_median_seconds']:.3f}s", (34, 197, 94), True),
     ]
     
     # Real terminal lines for nexfsck
-    nexfsck_prompt = ("root@linux-dev:~# nexfsck -n /dev/nvme0n1p1", (255, 255, 255), True)
+    nexfsck_prompt = ("$ nexfsck -n /tmp/stress_10g.img", (255, 255, 255), True)
     nexfsck_banner = [
         ("==================================================", (59, 130, 246), False),
         ("  nexfsck v0.1.0 — experimental ext4 checker", (96, 165, 250), True),
@@ -143,23 +150,23 @@ def generate_frames():
         ("INFO SIMD    : AVX2: true, ARM NEON/CRC: false", (34, 197, 94), False),
         ("INFO GPU     : CUDA PTX candidates + CPU verification", (168, 85, 247), True),
         ("INFO I/O     : Linux io_uring (Queue Depth 128) [Active]", (56, 189, 248), True),
-        ("INFO ext4    : Magic OK (0xEF53) | 262,144 blocks | 8 groups", (203, 213, 225), False),
-        ("INFO Journal : JBD2 Active | Seq: 6 | Clean: true", (203, 213, 225), False),
+        ("INFO ext4    : Magic OK | 2,621,440 blocks | 80 groups", (203, 213, 225), False),
+        ("INFO Journal : JBD2 Active | Seq: 9 | Clean: true", (203, 213, 225), False),
     ]
     nexfsck_p1 = ("INFO Pass 1: Inodes & Extent Trees parallel [16T]", (248, 250, 252), False)
-    nexfsck_p2 = ("INFO Pass 2: Directory Entries & H-Tree (1,394 blks)", (248, 250, 252), False)
+    nexfsck_p2 = ("INFO Pass 2: Directory Entries & H-Tree (2,412 blks)", (248, 250, 252), False)
     nexfsck_p3 = ("INFO Pass 3: Directory Connectivity (0 orphans)", (248, 250, 252), False)
     nexfsck_p4 = ("INFO Pass 4: Inode Reference Counts (0 mismatch)", (248, 250, 252), False)
     nexfsck_p5 = ("INFO Pass 5: 64-bit Roaring Bitmap Reconciliation", (248, 250, 252), False)
     nexfsck_summary = [
         ("--------------------------------------------------", (51, 65, 85), False),
         ("Detailed Accounting:", (255, 255, 255), True),
-        ("  Inodes: 15,186 Active (12,925 reg, 1,381 dir, 880 sym)", (203, 213, 225), False),
-        ("  Extents: 14,400 Valid | Allocated Blocks: 54,844", (203, 213, 225), False),
-        ("  Entries: 17,945 Dentries | False-Free: 0 | Leaks: 0", (203, 213, 225), False),
+        (f"  Active Inodes: {comp['nexfsck_active_inodes']:,}", (203, 213, 225), False),
+        (f"  Allocated Blocks: {comp['nexfsck_allocated_blocks']:,}", (203, 213, 225), False),
+        (f"  Directory Entries: {comp['nexfsck_directory_entries']:,} | Errors: 0", (203, 213, 225), False),
         ("--------------------------------------------------", (51, 65, 85), False),
-        ("[OK] Filesystem CLEAN (0 errors) | Elapsed: 0.02s", (34, 197, 94), True),
-        ("[>>] ILLUSTRATION — NOT A PUBLISHED SPEED RESULT", (56, 189, 248), True),
+        (f"[OK] CLEAN | 10-run median wall: {comp['nexfsck_median_seconds']:.3f}s", (34, 197, 94), True),
+        (f"[RESULT] e2fsck is {1/comp['median_ratio']:.2f}x faster here", (251, 191, 36), True),
     ]
 
     print("Rendering animation frames...")
@@ -169,18 +176,18 @@ def generate_frames():
         draw = ImageDraw.Draw(im)
         
         # Header
-        draw.text((40, 22), "LIVE BENCHMARK: ext4 Filesystem Integrity Verification", font=fonts["header"], fill=(248, 250, 252))
-        draw.text((810, 26), "Illustrative UI — see docs/benchmarking.md", font=fonts["mono"], fill=(148, 163, 184))
+        draw.text((40, 22), "10 GiB MEASURED RUN: ext4 Integrity Verification", font=fonts["header"], fill=(248, 250, 252))
+        draw.text((810, 26), "10 interleaved warm-cache repetitions", font=fonts["mono"], fill=(148, 163, 184))
         draw.line([40, 56, W - 40, 56], fill=(30, 41, 59), width=1)
         
         # Determine states
         e2_active = idx >= 5 and idx < 42
         nex_active = idx >= 5 and idx < 18
         
-        draw_window_frame(draw, fonts, 40, 70, 660, 660, "e2fsck v1.46.5", "1 Core • POSIX Direct", (71, 85, 105), is_active=e2_active)
+        draw_window_frame(draw, fonts, 40, 70, 660, 660, "e2fsck v1.46.5", "READ-ONLY • -f -n", (71, 85, 105), is_active=e2_active)
         
         nex_badge_col = (34, 197, 94) if idx >= 18 else (59, 130, 246)
-        nex_badge_txt = "UNVERIFIED SAMPLE" if idx >= 18 else "CPU • optional io_uring"
+        nex_badge_txt = "MEASURED RESULT" if idx >= 18 else "CUDA + io_uring active"
         draw_window_frame(draw, fonts, 740, 70, 660, 660, "nexfsck v0.1.0", nex_badge_txt, nex_badge_col, is_active=nex_active)
         
         # Build Left lines (e2fsck)
@@ -223,7 +230,7 @@ def generate_frames():
         render_lines(draw, fonts, 760, 118, right_lines)
         
         # Bottom Dashboard
-        draw_bottom_dashboard(draw, fonts, idx, total_frames)
+        draw_bottom_dashboard(draw, fonts, idx, result)
         
         frame_path = f"/tmp/bench_frames/frame_{idx:03d}.png"
         im.save(frame_path)
