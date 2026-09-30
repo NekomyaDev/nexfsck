@@ -284,12 +284,13 @@ fn main() -> ExitCode {
                     sb.inode_size() as usize,
                 );
 
-                for inode in &inodes {
+                for (i, inode) in inodes.iter().enumerate() {
+                    let ino_num = (bg_idx as u32) * sb.inodes_per_group() + (i as u32) + 1;
                     if inode.is_used() && inode.is_dir() && inode.uses_extents() {
                         if let Some(hdr) = inode.extent_header() {
                             if hdr.depth() == 0 && hdr.entries() > 0 {
                                 if let Ok((ext, _)) = nexfsck_core::Ext4Extent::ref_from_prefix(&inode.i_block[12..]) {
-                                    directory_blocks_to_check.push(ext.physical_start());
+                                    directory_blocks_to_check.push((ino_num, ext.physical_start()));
                                 }
                             }
                         }
@@ -317,18 +318,73 @@ fn main() -> ExitCode {
         info!("Pass 2: Checking Directory Entries and H-Trees ({} directory block(s))...", directory_blocks_to_check.len());
     }
     let mut total_dentry_count = 0;
-    for dir_block in directory_blocks_to_check {
+    let mut actual_link_counts: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
+    let mut reachable_from_dir: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    reachable_from_dir.insert(nexfsck_core::EXT4_ROOT_INO);
+
+    for (_dir_ino, dir_block) in directory_blocks_to_check {
         if let Ok(block_bytes) = dev.read_block(dir_block, block_size) {
             let res = verify_directory_block_detailed(&block_bytes, sb.total_inodes());
             total_dentry_count += res.entries.len();
             if res.corrupt_entries > 0 {
                 inode_stats.corrupt_directories.fetch_add(res.corrupt_entries, Ordering::Relaxed);
             }
+            for (child_ino, name) in res.entries {
+                *actual_link_counts.entry(child_ino).or_insert(0) += 1;
+                if name != "." && name != ".." {
+                    reachable_from_dir.insert(child_ino);
+                }
+            }
         }
     }
     let corrupt_dirs = inode_stats.corrupt_directories.load(Ordering::Relaxed);
     if !args.json {
         info!("Pass 2: Validated {} directory entries (corrupted entries: {}).", total_dentry_count, corrupt_dirs);
+    }
+
+    // Pass 3: Directory Connectivity & Orphan Directory Reclamation
+    if !args.json {
+        info!("Pass 3: Checking Directory Connectivity and Orphan Subtrees...");
+    }
+    let mut orphan_directories_count = 0u64;
+    for (bg_idx, inodes) in &all_scanned_inodes {
+        for (i, inode) in inodes.iter().enumerate() {
+            let ino_num = (*bg_idx as u32) * sb.inodes_per_group() + (i as u32) + 1;
+            if inode.is_used() && inode.is_dir() && ino_num >= sb.first_inode() {
+                if !reachable_from_dir.contains(&ino_num) {
+                    warn!("Orphan directory detected: Inode {} is disconnected from root directory tree", ino_num);
+                    orphan_directories_count += 1;
+                }
+            }
+        }
+    }
+    inode_stats.orphan_directories.store(orphan_directories_count, Ordering::Relaxed);
+    if !args.json {
+        info!("Pass 3: Directory connectivity verified (orphan directories: {}).", orphan_directories_count);
+    }
+
+    // Pass 4: Inode Reference & Link Counts Verification
+    if !args.json {
+        info!("Pass 4: Checking Inode Reference Counts (Hard links)...");
+    }
+    let mut link_mismatches_count = 0u64;
+    for (bg_idx, inodes) in &all_scanned_inodes {
+        for (i, inode) in inodes.iter().enumerate() {
+            let ino_num = (*bg_idx as u32) * sb.inodes_per_group() + (i as u32) + 1;
+            if inode.is_used() && ino_num >= sb.first_inode() {
+                let recorded_links = inode.links_count();
+                let actual_links = actual_link_counts.get(&ino_num).copied().unwrap_or(0);
+                if actual_links > 0 && recorded_links != actual_links {
+                    debug!("Link count discrepancy on inode {}: recorded={}, actual={}", ino_num, recorded_links, actual_links);
+                    link_mismatches_count += 1;
+                }
+            }
+        }
+    }
+    inode_stats.link_count_mismatches.store(link_mismatches_count, Ordering::Relaxed);
+    if !args.json {
+        info!("Pass 4: Inode reference counts validated (mismatches: {}).", link_mismatches_count);
     }
 
     // Pass 5: Block & Inode Allocation Bitmap Reconciliation
@@ -356,7 +412,7 @@ fn main() -> ExitCode {
 
         if let Ok(disk_inomb) = dev.read_inode_bitmap(desc, is_64bit, block_size) {
             if let Some((_, inodes)) = all_scanned_inodes.iter().find(|(idx, _)| *idx == bg_idx) {
-                let disc = reconcile_inode_bitmap(&disk_inomb, inodes);
+                let disc = reconcile_inode_bitmap(&disk_inomb, inodes, sb.first_inode(), bg_idx, sb.inodes_per_group());
                 total_inode_discrepancy.false_free_inodes += disc.false_free_inodes;
                 total_inode_discrepancy.leaked_inodes += disc.leaked_inodes;
             }
@@ -368,8 +424,10 @@ fn main() -> ExitCode {
     let oob = inode_stats.out_of_bounds_blocks.load(Ordering::Relaxed);
     let fast_symlinks = inode_stats.fast_symlinks_checked.load(Ordering::Relaxed);
     let corrupt_symlinks = inode_stats.corrupted_symlinks.load(Ordering::Relaxed);
+    let orphan_dirs = inode_stats.orphan_directories.load(Ordering::Relaxed);
+    let link_mismatches = inode_stats.link_count_mismatches.load(Ordering::Relaxed);
 
-    stats.errors_found += corruptions + duplicates + oob + corrupt_symlinks + corrupt_dirs + total_block_discrepancy.false_free_blocks + total_inode_discrepancy.false_free_inodes;
+    stats.errors_found += corruptions + duplicates + oob + corrupt_symlinks + corrupt_dirs + orphan_dirs + link_mismatches + total_block_discrepancy.false_free_blocks + total_inode_discrepancy.false_free_inodes;
 
     // 6. Active Repair Mode Execution
     let mut errors_were_corrected = false;
@@ -465,6 +523,8 @@ fn main() -> ExitCode {
         println!("  \"allocated_blocks\": {},", tracker.allocated_count());
         println!("  \"directory_entries\": {},", total_dentry_count);
         println!("  \"corrupt_directories\": {},", corrupt_dirs);
+        println!("  \"orphan_directories\": {},", orphan_dirs);
+        println!("  \"link_count_mismatches\": {},", link_mismatches);
         println!("  \"extent_corruptions\": {},", corruptions);
         println!("  \"duplicate_blocks\": {},", duplicates);
         println!("  \"out_of_bounds_blocks\": {},", oob);
@@ -515,6 +575,8 @@ fn main() -> ExitCode {
         );
         println!("Directory Entries  : {}", total_dentry_count);
         println!("Corrupt Directories: {}", corrupt_dirs);
+        println!("Orphan Directories : {}", orphan_dirs);
+        println!("Link Discrepancies : {}", link_mismatches);
         println!("Extent Corruptions : {}", corruptions);
         println!("Duplicate Blocks   : {}", duplicates);
         println!("Out-of-Bounds Blks : {}", oob);

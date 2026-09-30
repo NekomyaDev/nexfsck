@@ -104,6 +104,8 @@ pub struct InodeVerificationStats {
     pub out_of_bounds_blocks: AtomicU64,
     pub extent_corruptions: AtomicU64,
     pub corrupt_directories: AtomicU64,
+    pub orphan_directories: AtomicU64,
+    pub link_count_mismatches: AtomicU64,
 }
 
 impl InodeVerificationStats {
@@ -194,7 +196,7 @@ pub fn verify_inodes_parallel(
             }
         }
 
-        // Validate extent tree if used
+        // Validate extent tree or legacy block pointers
         if inode.uses_extents() && !inode.is_inline_data() {
             stats.extent_trees_checked.fetch_add(1, Ordering::Relaxed);
             verify_extent_block(
@@ -205,6 +207,14 @@ pub fn verify_inodes_parallel(
                 &|_| None,
                 0,
             );
+        } else if !inode.is_inline_data() && !inode.is_fast_symlink() {
+            // Traditional direct and indirect block pointers (Ext2/3/4 legacy format, e.g. resize inode 7)
+            for chunk in inode.i_block.chunks_exact(4) {
+                let blk = u32::from_le_bytes(chunk.try_into().unwrap()) as u64;
+                if blk != 0 && blk < tracker.total_blocks() {
+                    tracker.mark_range(blk, 1);
+                }
+            }
         }
     });
 }
@@ -220,10 +230,14 @@ pub struct InodeBitmapDiscrepancy {
 pub fn reconcile_inode_bitmap(
     disk_bitmap: &[u8],
     inodes: &[Ext4Inode],
+    first_ino: u32,
+    bg_idx: usize,
+    inodes_per_group: u32,
 ) -> InodeBitmapDiscrepancy {
     let mut discrepancy = InodeBitmapDiscrepancy::default();
 
     for (i, inode) in inodes.iter().enumerate() {
+        let abs_ino = (bg_idx as u32) * inodes_per_group + (i as u32) + 1;
         let byte_idx = i / 8;
         let bit_idx = i % 8;
 
@@ -238,7 +252,11 @@ pub fn reconcile_inode_bitmap(
         if inode_is_used && !disk_is_allocated {
             discrepancy.false_free_inodes += 1;
         } else if !inode_is_used && disk_is_allocated {
-            discrepancy.leaked_inodes += 1;
+            // Reserved standard system inodes (1..first_ino - 1) are intentionally
+            // allocated in the bitmap by mkfs.ext4 and are not leaked user inodes.
+            if abs_ino >= first_ino {
+                discrepancy.leaked_inodes += 1;
+            }
         }
     }
 

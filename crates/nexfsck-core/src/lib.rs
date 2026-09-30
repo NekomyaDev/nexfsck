@@ -18,6 +18,19 @@ pub const EXT4_SUPERBLOCK_SIZE: usize = 1024;
 /// Extent magic number (0xF30A).
 pub const EXT4_EXTENT_MAGIC: u16 = 0xF30A;
 
+// Special ext4 Inode numbers
+pub const EXT4_BAD_INO: u32 = 1;
+pub const EXT4_ROOT_INO: u32 = 2;
+pub const EXT4_USR_QUOTA_INO: u32 = 3;
+pub const EXT4_GRP_QUOTA_INO: u32 = 4;
+pub const EXT4_BOOT_LOADER_INO: u32 = 5;
+pub const EXT4_UNDEL_DIR_INO: u32 = 6;
+pub const EXT4_RESIZE_INO: u32 = 7;
+pub const EXT4_JOURNAL_INO: u32 = 8;
+pub const EXT4_EXCLUDE_INO: u32 = 9;
+pub const EXT4_REPLICA_INO: u32 = 10;
+pub const EXT4_LOST_FOUND_INO: u32 = 11;
+
 // Inode flags
 pub const EXT4_SECRM_FL: u32 = 0x00000001;
 pub const EXT4_UNRM_FL: u32 = 0x00000002;
@@ -252,6 +265,15 @@ impl Ext4Superblock {
 
     pub fn total_inodes(&self) -> u32 {
         u32::from_le(self.s_inodes_count)
+    }
+
+    pub fn first_inode(&self) -> u32 {
+        let first = u32::from_le(self.s_first_ino);
+        if first == 0 {
+            11
+        } else {
+            first
+        }
     }
 
     pub fn inodes_per_group(&self) -> u32 {
