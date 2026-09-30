@@ -241,6 +241,7 @@ dependencies = [
  "roaring",
  "thiserror",
  "tracing",
+ "zerocopy",
 ]
 
 [[package]]

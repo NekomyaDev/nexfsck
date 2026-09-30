@@ -2,9 +2,12 @@
 
 use clap::Parser;
 use std::process::ExitCode;
-use tracing::{error, info};
+use std::sync::atomic::Ordering;
+use tracing::{debug, error, info, warn};
 
-use nexfsck_compute::HardwareProfile;
+use nexfsck_compute::{
+    verify_inodes_parallel, BlockAllocationTracker, HardwareProfile, InodeVerificationStats,
+};
 use nexfsck_gpu::GpuAccelerator;
 use nexfsck_io::BlockDevice;
 use nexfsck_tui::ProgressStats;
@@ -68,12 +71,12 @@ fn main() -> ExitCode {
     let gpu = GpuAccelerator::probe();
 
     info!(
-        "Detected Hardware: {} CPU cores, {:.1} GB RAM",
+        "Hardware Detected: {} CPU cores (Rayon work-stealing active), {:.1} GB RAM",
         hw.cpu_cores,
         hw.total_ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     info!(
-        "SIMD Acceleration: AVX-512: {}, AVX2: {}, ARM NEON/CRC: {}",
+        "SIMD Capabilities: AVX-512: {}, AVX2: {}, ARM NEON/CRC: {}",
         hw.has_avx512, hw.has_avx2, hw.has_arm_crc32
     );
     info!(
@@ -82,7 +85,7 @@ fn main() -> ExitCode {
         gpu.vram_bytes() as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
-    // 2. Open Block Device
+    // 2. Open Block Device & Flush Cache
     info!("Opening target storage: {}", args.device);
     let dev = match BlockDevice::open(&args.device, args.read_only) {
         Ok(d) => d,
@@ -101,26 +104,132 @@ fn main() -> ExitCode {
         }
     };
 
+    let is_64bit = sb.has_incompat_feature(nexfsck_core::EXT4_FEATURE_INCOMPAT_64BIT);
+    let total_blocks = sb.total_blocks();
+    let bg_count = sb.block_groups_count();
+
     info!(
-        "Filesystem Magic OK (0x{:04X}) | Block Size: {} bytes",
+        "Filesystem Magic OK (0x{:04X}) | Block Size: {}B | Inode Size: {}B | 64-bit: {}",
         u16::from_le(sb.s_magic),
-        sb.block_size()
+        sb.block_size(),
+        sb.inode_size(),
+        is_64bit
     );
     info!(
         "Total Blocks: {} | Free Blocks: {} | Total Inodes: {}",
-        sb.total_blocks(),
+        total_blocks,
         sb.free_blocks(),
-        u32::from_le(sb.s_inodes_count)
+        sb.total_inodes()
     );
-    info!("Total Block Groups: {}", sb.block_groups_count());
+    info!("Total Block Groups: {}", bg_count);
 
-    // 4. Initialize Telemetry & Progress
-    let mut stats = ProgressStats::new(sb.block_groups_count());
-    stats.processed_groups = sb.block_groups_count(); // Phase 1 mock/read complete
+    // 4. Read Block Group Descriptors
+    info!("Reading {} Block Group Descriptors...", bg_count);
+    let group_descriptors = match dev.read_group_descriptors(&sb) {
+        Ok(desc) => desc,
+        Err(e) => {
+            error!("Failed to read block group descriptors: {}", e);
+            return ExitCode::from(FSCK_EXIT_ERRORS_UNCORRECTED);
+        }
+    };
 
+    // 5. Initialize In-Memory Roaring Bitmaps & Telemetry
+    let tracker = BlockAllocationTracker::new(total_blocks);
+    let inode_stats = InodeVerificationStats::new();
+    let mut stats = ProgressStats::new(bg_count);
+
+    info!("Pass 1: Checking Inode Tables and Extent Trees in parallel...");
+
+    for (bg_idx, desc) in group_descriptors.iter().enumerate() {
+        let free_inodes = desc.free_inodes_count(is_64bit);
+        debug!(
+            "Group {}: flags=0x{:04X}, uninit={}, free_inodes={}, total_inodes_per_group={}",
+            bg_idx,
+            desc.flags(),
+            desc.is_inode_uninit(),
+            free_inodes,
+            sb.inodes_per_group()
+        );
+        if desc.is_inode_uninit() && free_inodes == sb.inodes_per_group() {
+            // Truly empty and uninitialized block group
+            stats.processed_groups += 1;
+            continue;
+        }
+
+        match dev.read_inode_table(&sb, desc, is_64bit) {
+            Ok(table_bytes) => {
+                let inodes = BlockDevice::parse_inodes_from_table(
+                    &table_bytes,
+                    sb.inode_size() as usize,
+                );
+                verify_inodes_parallel(&inodes, &tracker, &inode_stats);
+                stats.bytes_scanned += table_bytes.len() as u64;
+            }
+            Err(e) => {
+                warn!(
+                    "Block group {} inode table read error: {}. Isolating group.",
+                    bg_idx, e
+                );
+                stats.errors_found += 1;
+            }
+        }
+
+        stats.processed_groups += 1;
+    }
+
+    let corruptions = inode_stats.extent_corruptions.load(Ordering::Relaxed);
+    let duplicates = inode_stats.duplicate_blocks.load(Ordering::Relaxed);
+    let oob = inode_stats.out_of_bounds_blocks.load(Ordering::Relaxed);
+    stats.errors_found += corruptions + duplicates + oob;
+
+    // 6. Report Summary
     println!();
     stats.print_summary();
-    info!("Filesystem consistency check completed cleanly.");
 
-    ExitCode::from(FSCK_EXIT_OK)
+    println!("--------------------------------------------------");
+    println!("Detailed Inode & Block Accounting:");
+    println!("--------------------------------------------------");
+    println!(
+        "Inodes Scanned     : {}",
+        inode_stats.total_inodes_scanned.load(Ordering::Relaxed)
+    );
+    println!(
+        "Active Inodes      : {}",
+        inode_stats.used_inodes.load(Ordering::Relaxed)
+    );
+    println!(
+        "  - Directories    : {}",
+        inode_stats.directory_inodes.load(Ordering::Relaxed)
+    );
+    println!(
+        "  - Regular Files  : {}",
+        inode_stats.regular_file_inodes.load(Ordering::Relaxed)
+    );
+    println!(
+        "  - Symlinks       : {}",
+        inode_stats.symlink_inodes.load(Ordering::Relaxed)
+    );
+    println!(
+        "Extent Trees Valid : {}",
+        inode_stats.extent_trees_checked.load(Ordering::Relaxed)
+    );
+    println!(
+        "Allocated Blocks   : {} (Tracked in Roaring Bitmaps)",
+        tracker.allocated_count()
+    );
+    println!("Extent Corruptions : {}", corruptions);
+    println!("Duplicate Blocks   : {}", duplicates);
+    println!("Out-of-Bounds Blks : {}", oob);
+    println!("--------------------------------------------------");
+
+    if stats.errors_found == 0 {
+        info!("Filesystem consistency check completed cleanly with ZERO errors.");
+        ExitCode::from(FSCK_EXIT_OK)
+    } else {
+        warn!(
+            "Filesystem consistency check completed with {} inconsistency error(s).",
+            stats.errors_found
+        );
+        ExitCode::from(FSCK_EXIT_ERRORS_UNCORRECTED)
+    }
 }

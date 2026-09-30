@@ -1,7 +1,7 @@
 //! `nexfsck-io`
 //!
 //! Direct I/O block device management, cache-flush invalidation,
-//! and high-throughput streaming reader.
+//! and high-throughput streaming reader with fault bisection.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
@@ -10,7 +10,10 @@ use std::path::Path;
 use thiserror::Error;
 use zerocopy::FromBytes;
 
-use nexfsck_core::{CoreError, Ext4Superblock, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE};
+use nexfsck_core::{
+    CoreError, Ext4GroupDesc, Ext4Inode, Ext4Superblock, EXT4_SUPERBLOCK_OFFSET,
+    EXT4_SUPERBLOCK_SIZE,
+};
 
 #[derive(Error, Debug)]
 pub enum IoError {
@@ -25,6 +28,12 @@ pub enum IoError {
 
     #[error("Device size error: {0}")]
     DeviceSize(String),
+
+    #[error("Unrecoverable media read error at offset {offset}: {source}")]
+    MediaError {
+        offset: u64,
+        source: std::io::Error,
+    },
 }
 
 /// Linux block device handle equipped with safe Direct I/O and cache invalidation.
@@ -63,7 +72,6 @@ impl BlockDevice {
         let ret = unsafe { libc::ioctl(fd, BLKFLSBUF, 0) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            // Not fatal if running against a regular file (e.g. disk image test)
             tracing::debug!("BLKFLSBUF ioctl returned {ret} ({err}); continuing");
         }
         Ok(())
@@ -82,6 +90,120 @@ impl BlockDevice {
 
         sb.verify_magic()?;
         Ok(*sb)
+    }
+
+    /// Reads all Block Group Descriptors from disk into memory.
+    pub fn read_group_descriptors(&self, sb: &Ext4Superblock) -> Result<Vec<Ext4GroupDesc>, IoError> {
+        let block_size = sb.block_size();
+        let desc_size = sb.desc_size();
+        let bg_count = sb.block_groups_count() as usize;
+
+        // BGD table starts at block 1 for 4KB blocks, or block 2 for 1KB blocks
+        let first_data_block = u32::from_le(sb.s_first_data_block) as u64;
+        let bgd_table_offset = (first_data_block + 1) * block_size;
+
+        let total_bytes = bg_count * desc_size;
+        let mut buffer = vec![0u8; total_bytes];
+
+        self.read_exact_resilient(bgd_table_offset, &mut buffer, block_size as usize)?;
+
+        let mut descriptors = Vec::with_capacity(bg_count);
+        for i in 0..bg_count {
+            let start = i * desc_size;
+            let end = start + desc_size;
+            let slice = &buffer[start..end];
+
+            let mut full_desc = [0u8; 64];
+            let copy_len = desc_size.min(64);
+            full_desc[..copy_len].copy_from_slice(&slice[..copy_len]);
+
+            let (desc, _) = Ext4GroupDesc::ref_from_prefix(&full_desc)
+                .map_err(|_| CoreError::Corruption("Failed to parse group descriptor".into()))?;
+
+            descriptors.push(*desc);
+        }
+
+        Ok(descriptors)
+    }
+
+    /// Reads raw bytes for the inode table of a specified block group.
+    pub fn read_inode_table(
+        &self,
+        sb: &Ext4Superblock,
+        desc: &Ext4GroupDesc,
+        is_64bit: bool,
+    ) -> Result<Vec<u8>, IoError> {
+        let block_size = sb.block_size();
+        let table_start_block = desc.inode_table_block(is_64bit);
+        let byte_offset = table_start_block * block_size;
+
+        let inodes_per_group = sb.inodes_per_group() as usize;
+        let inode_size = sb.inode_size() as usize;
+        let total_bytes = inodes_per_group * inode_size;
+
+        let mut buffer = vec![0u8; total_bytes];
+        self.read_exact_resilient(byte_offset, &mut buffer, block_size as usize)?;
+
+        Ok(buffer)
+    }
+
+    /// Reads exact bytes with Hierarchical Bisection Fault Isolation.
+    /// If an entire batch read fails due to a bad sector, it bisects recursively
+    /// down to sector granularity to isolate only the corrupted sectors with zeros,
+    /// salvaging all adjacent healthy data.
+    pub fn read_exact_resilient(
+        &self,
+        offset: u64,
+        buf: &mut [u8],
+        sector_size: usize,
+    ) -> Result<(), IoError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        match self.file.read_exact_at(buf, offset) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if buf.len() <= sector_size {
+                    // Reached single sector granularity: log media error and zero out sector
+                    tracing::warn!(
+                        "Physical media error at byte offset {}: {}. Isolating sector with zeros.",
+                        offset,
+                        e
+                    );
+                    buf.fill(0);
+                    Ok(())
+                } else {
+                    // Bisect into two halves
+                    let mid = buf.len() / 2;
+                    let (left, right) = buf.split_at_mut(mid);
+                    self.read_exact_resilient(offset, left, sector_size)?;
+                    self.read_exact_resilient(offset + mid as u64, right, sector_size)?;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Parses inodes from raw inode table bytes.
+    pub fn parse_inodes_from_table(
+        table_bytes: &[u8],
+        inode_size: usize,
+    ) -> Vec<Ext4Inode> {
+        let count = table_bytes.len() / inode_size;
+        let mut inodes = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let start = i * inode_size;
+            let end = start + inode_size;
+            let slice = &table_bytes[start..end];
+
+            if let Ok((inode, _)) = Ext4Inode::ref_from_prefix(slice) {
+                inodes.push(*inode);
+            }
+        }
+
+        inodes
     }
 
     pub fn path(&self) -> &str {
