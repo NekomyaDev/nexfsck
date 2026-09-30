@@ -9,13 +9,13 @@ fn test_clean_ext4_image_verification() {
 
     // Create 32MB ext4 test filesystem
     let truncate_status = Command::new("truncate")
-        .args(&["-s", "32M", img_path])
+        .args(["-s", "32M", img_path])
         .status()
         .expect("Failed to execute truncate");
     assert!(truncate_status.success());
 
     let mkfs_status = Command::new("mkfs.ext4")
-        .args(&["-F", img_path])
+        .args(["-F", img_path])
         .status()
         .expect("Failed to execute mkfs.ext4");
     assert!(mkfs_status.success());
@@ -41,10 +41,10 @@ fn test_corrupted_magic_detection() {
 
     // 1. Create a 32MB ext4 filesystem
     let _ = Command::new("truncate")
-        .args(&["-s", "32M", img_path])
+        .args(["-s", "32M", img_path])
         .status();
 
-    let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
+    let _ = Command::new("mkfs.ext4").args(["-F", img_path]).status();
 
     // 2. Corrupt superblock magic (offset 1024 + 56 in ext4 superblock)
     let mut file = OpenOptions::new()
@@ -81,10 +81,10 @@ fn test_atomic_rollback_and_restore() {
 
     // 1. Create clean ext4 filesystem
     let _ = Command::new("truncate")
-        .args(&["-s", "32M", img_path])
+        .args(["-s", "32M", img_path])
         .status();
 
-    let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
+    let _ = Command::new("mkfs.ext4").args(["-F", img_path]).status();
 
     // 2. Save block 0 (original data containing valid superblock) into undo journal
     let mut dev_file = OpenOptions::new()
@@ -115,7 +115,7 @@ fn test_atomic_rollback_and_restore() {
 
     // 4. Run nexfsck with --rollback
     let rollback_status = Command::new(nexfsck_bin)
-        .args(&["--rollback", "--undo-file", undo_log, img_path])
+        .args(["--rollback", "--undo-file", undo_log, img_path])
         .status()
         .expect("Failed to execute rollback");
     assert!(rollback_status.success());
@@ -138,13 +138,13 @@ fn test_json_telemetry_output() {
     let _ = std::fs::remove_file(img_path);
 
     let _ = Command::new("truncate")
-        .args(&["-s", "32M", img_path])
+        .args(["-s", "32M", img_path])
         .status();
-    let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
+    let _ = Command::new("mkfs.ext4").args(["-F", img_path]).status();
 
     let nexfsck_bin = env!("CARGO_BIN_EXE_nexfsck");
     let output = Command::new(nexfsck_bin)
-        .args(&["--json", img_path])
+        .args(["--json", img_path])
         .output()
         .expect("Failed to run nexfsck --json");
 
@@ -168,9 +168,9 @@ fn test_active_repair_false_free_block() {
 
     // 1. Create clean ext4 filesystem
     let _ = Command::new("truncate")
-        .args(&["-s", "32M", img_path])
+        .args(["-s", "32M", img_path])
         .status();
-    let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
+    let _ = Command::new("mkfs.ext4").args(["-F", img_path]).status();
 
     // 2. Artificially clear a bit in block bitmap (block 5 is block bitmap in group 0)
     // Clear bit 0 of block 0 (superblock) so it becomes a false-free block
@@ -194,21 +194,21 @@ fn test_active_repair_false_free_block() {
 
     // 3. Verification in read-only mode must detect false-free block error (exit code 4)
     let verify_status = Command::new(nexfsck_bin)
-        .args(&["-n", img_path])
+        .args(["-n", img_path])
         .status()
         .unwrap();
     assert_eq!(verify_status.code(), Some(4));
 
     // 4. Run with --repair / -y -> must repair and return exit code 1 (FSCK_EXIT_ERRORS_CORRECTED)
     let repair_status = Command::new(nexfsck_bin)
-        .args(&["--repair", "--undo-file", undo_file, img_path])
+        .args(["--repair", "--undo-file", undo_file, img_path])
         .status()
         .unwrap();
     assert_eq!(repair_status.code(), Some(1));
 
     // 5. Subsequent verification in read-only mode must now be completely clean (exit code 0)!
     let clean_status = Command::new(nexfsck_bin)
-        .args(&["-n", img_path])
+        .args(["-n", img_path])
         .status()
         .unwrap();
     assert_eq!(clean_status.code(), Some(0));
@@ -227,9 +227,9 @@ fn test_active_repair_false_free_inode() {
 
     // 1. Create clean ext4 filesystem
     let _ = Command::new("truncate")
-        .args(&["-s", "32M", img_path])
+        .args(["-s", "32M", img_path])
         .status();
-    let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
+    let _ = Command::new("mkfs.ext4").args(["-F", img_path]).status();
 
     // 2. Artificially clear bit 1 (inode 2) in inode bitmap (block 21 in 32M ext4)
     let mut file = OpenOptions::new()
@@ -250,21 +250,21 @@ fn test_active_repair_false_free_inode() {
 
     // 3. Read-only mode must detect false-free inode error (exit code 4)
     let verify_status = Command::new(nexfsck_bin)
-        .args(&["-n", img_path])
+        .args(["-n", img_path])
         .status()
         .unwrap();
     assert_eq!(verify_status.code(), Some(4));
 
     // 4. Run --repair -> must repair and return exit code 1
     let repair_status = Command::new(nexfsck_bin)
-        .args(&["--repair", "--undo-file", undo_file, img_path])
+        .args(["--repair", "--undo-file", undo_file, img_path])
         .status()
         .unwrap();
     assert_eq!(repair_status.code(), Some(1));
 
     // 5. Subsequent read-only check must pass cleanly (exit code 0)
     let clean_status = Command::new(nexfsck_bin)
-        .args(&["-n", img_path])
+        .args(["-n", img_path])
         .status()
         .unwrap();
     assert_eq!(clean_status.code(), Some(0));
@@ -281,9 +281,9 @@ fn test_corrupt_directory_entry_detection() {
 
     // 1. Create clean ext4 filesystem
     let _ = Command::new("truncate")
-        .args(&["-s", "32M", img_path])
+        .args(["-s", "32M", img_path])
         .status();
-    let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
+    let _ = Command::new("mkfs.ext4").args(["-F", img_path]).status();
 
     // 2. Corrupt root directory block (block 6 at offset 24576):
     // Inject invalid unaligned rec_len (e.g. 5 bytes instead of 12) at offset 24576 + 4
@@ -302,7 +302,7 @@ fn test_corrupt_directory_entry_detection() {
 
     // 3. Read-only verification must detect directory corruption and exit with code 4
     let verify_status = Command::new(nexfsck_bin)
-        .args(&["-n", img_path])
+        .args(["-n", img_path])
         .status()
         .unwrap();
     assert_eq!(verify_status.code(), Some(4));

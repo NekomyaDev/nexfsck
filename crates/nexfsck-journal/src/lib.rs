@@ -339,7 +339,7 @@ fn parse_revoke_block(
     }
     let used = u32::from_be_bytes(block[12..16].try_into().unwrap()) as usize;
     let entry_size = if block_64bit { 8 } else { 4 };
-    if used < 16 || used > block.len() || (used - 16) % entry_size != 0 {
+    if used < 16 || used > block.len() || (used - 16) & (entry_size - 1) != 0 {
         return Err(JournalError::CorruptLog(
             "invalid JBD2 revoke length".into(),
         ));

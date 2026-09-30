@@ -154,10 +154,10 @@ impl IoUringEngine {
                 for request in chunk {
                     results.push(BatchReadResult {
                         id: request.id,
-                        data: Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("io_uring submit error: {}", e),
-                        )),
+                        data: Err(std::io::Error::other(format!(
+                            "io_uring submit error: {}",
+                            e
+                        ))),
                     });
                 }
                 continue;
@@ -168,8 +168,8 @@ impl IoUringEngine {
                 (0..chunk.len()).map(|_| None).collect();
             let completions: Vec<(usize, i32)> = {
                 let mut completed = Vec::with_capacity(chunk.len());
-                let mut cq = state.ring.completion();
-                while let Some(cqe) = cq.next() {
+                let cq = state.ring.completion();
+                for cqe in cq {
                     completed.push((cqe.user_data() as usize, cqe.result()));
                 }
                 completed

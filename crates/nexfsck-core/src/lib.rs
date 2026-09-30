@@ -290,7 +290,7 @@ impl Ext4Superblock {
             return 0;
         }
         let total = self.total_blocks();
-        (total + bpg - 1) / bpg
+        total.div_ceil(bpg)
     }
 
     /// Determines if a specific block group contains a superblock and group descriptor backup.

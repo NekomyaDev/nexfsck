@@ -211,7 +211,7 @@ impl BlockAllocationTracker {
             let chunk_idx = (b >> 32) as u32;
             let offset = (b & 0xFFFF_FFFF) as u32;
 
-            let bm = chunks.entry(chunk_idx).or_insert_with(RoaringBitmap::new);
+            let bm = chunks.entry(chunk_idx).or_default();
             if !bm.insert(offset) {
                 collision = true;
             } else {
@@ -291,8 +291,9 @@ pub fn verify_inodes_parallel<F>(
             );
         } else if !inode.is_inline_data() && !inode.is_fast_symlink() {
             // Traditional direct and indirect block pointers (Ext2/3/4 legacy format, e.g. resize inode 7)
-            for chunk in inode.i_block.chunks_exact(4) {
-                let blk = u32::from_le_bytes(chunk.try_into().unwrap()) as u64;
+            for offset in (0..inode.i_block.len()).step_by(4) {
+                let blk = u32::from_le_bytes(inode.i_block[offset..offset + 4].try_into().unwrap())
+                    as u64;
                 if blk != 0 && blk < tracker.total_blocks() {
                     tracker.mark_range(blk, 1);
                 }
@@ -661,7 +662,7 @@ pub fn verify_directory_block_detailed(
         let rec_len = header.record_len() as usize;
         let name_len = header.name_length() as usize;
 
-        if rec_len < 8 || rec_len % 4 != 0 || offset + rec_len > block_len {
+        if rec_len < 8 || rec_len & 3 != 0 || offset + rec_len > block_len {
             res.corrupt_entries += 1;
             break;
         }
@@ -708,8 +709,9 @@ where
     if inode.uses_extents() && !inode.is_inline_data() {
         collect_directory_blocks_from_extent(&inode.i_block, read_block_fn, 0, &mut blocks);
     } else if !inode.is_inline_data() && !inode.is_fast_symlink() {
-        for chunk in inode.i_block.chunks_exact(4) {
-            let blk = u32::from_le_bytes(chunk.try_into().unwrap()) as u64;
+        for offset in (0..inode.i_block.len()).step_by(4) {
+            let blk =
+                u32::from_le_bytes(inode.i_block[offset..offset + 4].try_into().unwrap()) as u64;
             if blk != 0 {
                 blocks.push(blk);
             }

@@ -272,10 +272,10 @@ fn main() -> ExitCode {
     let first_data_block = u32::from_le(sb.s_first_data_block) as u64;
     let blocks_per_group = sb.blocks_per_group();
     let desc_size = sb.desc_size() as u64;
-    let gdt_blocks = ((bg_count * desc_size) + block_size - 1) / block_size;
+    let gdt_blocks = (bg_count * desc_size).div_ceil(block_size);
     let reserved_gdt = u16::from_le(sb.s_reserved_gdt_blocks) as u64;
     let inode_table_blocks =
-        ((sb.inodes_per_group() as u64 * sb.inode_size() as u64) + block_size - 1) / block_size;
+        (sb.inodes_per_group() as u64 * sb.inode_size() as u64).div_ceil(block_size);
 
     if first_data_block > 0 {
         tracker.mark_range(0, first_data_block as u32);
@@ -473,11 +473,16 @@ fn main() -> ExitCode {
     for (bg_idx, inodes) in &all_scanned_inodes {
         for (i, inode) in inodes.iter().enumerate() {
             let ino_num = (*bg_idx as u32) * sb.inodes_per_group() + (i as u32) + 1;
-            if inode.is_used() && inode.is_dir() && ino_num >= sb.first_inode() {
-                if !reachable_from_dir.contains(&ino_num) {
-                    warn!("Orphan directory detected: Inode {} is disconnected from root directory tree", ino_num);
-                    orphan_directories_count += 1;
-                }
+            if inode.is_used()
+                && inode.is_dir()
+                && ino_num >= sb.first_inode()
+                && !reachable_from_dir.contains(&ino_num)
+            {
+                warn!(
+                    "Orphan directory detected: Inode {} is disconnected from root directory tree",
+                    ino_num
+                );
+                orphan_directories_count += 1;
             }
         }
     }

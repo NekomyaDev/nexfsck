@@ -225,7 +225,7 @@ fn probe_drm_vulkan() -> Option<(String, u64)> {
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map_or(false, |s| s.starts_with("card"))
+                .is_some_and(|s| s.starts_with("card"))
             {
                 let vram_path = path.join("device/mem_info_vram_total");
                 if let Ok(content) = std::fs::read_to_string(&vram_path) {

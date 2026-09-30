@@ -132,11 +132,7 @@ impl CudaContext {
             )?;
             let mut function = ptr::null_mut();
             check(
-                module_get_function(
-                    &mut function,
-                    module,
-                    b"collision_candidates\0".as_ptr().cast(),
-                ),
+                module_get_function(&mut function, module, c"collision_candidates".as_ptr()),
                 "cuModuleGetFunction",
             )?;
             Ok(Self {
@@ -184,7 +180,7 @@ impl CudaContext {
                 (&mut flags_arg as *mut CuDevicePtr).cast(),
                 (&mut count_arg as *mut u32).cast(),
             ];
-            let blocks = (intervals.len() as u32 + 255) / 256;
+            let blocks = (intervals.len() as u32).div_ceil(256);
             let result = check(
                 (self.launch)(
                     self.function,
