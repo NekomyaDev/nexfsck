@@ -34,3 +34,14 @@ Report these separately:
 5. byte identity: image hashes match, where deterministic layout makes this a meaningful expectation.
 
 “Bit-exact” is reserved for level 5 and must include the compared hashes. Existing stress scripts currently check only selected counters and clean exit status, so they cannot establish bit-exact parity.
+
+## Block-map memory profiling
+
+Run both a locality-friendly and a sparse case and retain stdout plus `/usr/bin/time -v` output:
+
+```bash
+/usr/bin/time -v cargo run --release -p nexfsck-compute --example bitmap_profile -- 1000000 1
+/usr/bin/time -v cargo run --release -p nexfsck-compute --example bitmap_profile -- 1000000 4294967296
+```
+
+The example reports actual RSS delta and chunk count. It measures address-map behavior on the executing machine; it does not establish exabyte-scale operational support.

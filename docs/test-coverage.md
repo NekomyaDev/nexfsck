@@ -19,8 +19,11 @@ This inventory reflects the automated tests currently in the repository. It is d
 | CRC32c known vector and hardware/scalar equivalence | `crc32c_known_vector`, `dispatched_crc_matches_scalar_for_lengths_and_seeds` |
 | H-Tree root/leaf validation and child bounds | `validates_minimal_htree_root_and_leaf`, `rejects_out_of_bounds_htree_child` |
 | CUDA/CPU collision equivalence; CUDA required with env flag | `collision_detection_is_deterministic` |
-| JBD2 committed, incomplete, and revoked transactions | `plans_only_committed_jbd2_data`, `ignores_uncommitted_tail`, `revoke_removes_committed_write` |
+| JBD2 committed, incomplete, revoked, checksum-v3, and 64-bit transactions | `plans_only_committed_jbd2_data`, `ignores_uncommitted_tail`, `revoke_removes_committed_write`, `validates_checksum_v3_and_64bit_target` |
+| Interrupted JBD2 replay and durable pre-image rollback | `interrupted_replay_can_be_rolled_back_from_synced_preimages` |
 | Heatmap/rates and Prometheus format | `heatmap_and_rates_are_reported`, `prometheus_contains_all_counters` |
 | 64-bit chunk boundaries and high-block collision tracking | `tracks_ranges_across_the_32_bit_chunk_boundary`, `detects_collision_above_four_billion_blocks` |
 
-Important uncovered cases include process-kill fault injection during repair/rollback, JBD2 checksum-v3 replay application, registered-buffer kernel integration on multiple kernel versions, very large sparse block-map memory profiling, media-error hardware injection, and multi-device/feature combinations.
+The CI matrix covers Ubuntu 22.04/24.04 and Rust 1.85/stable. A reproducible bitmap RSS profiler is available as the `bitmap_profile` example.
+
+Important uncovered cases include real power-loss injection (the automated replay test uses a deterministic interruption), CLI application of real-world JBD2 logs, registered-buffer integration across a broader kernel fleet, media-error hardware injection, and multi-device/feature combinations.

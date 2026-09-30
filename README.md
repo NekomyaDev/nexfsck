@@ -18,10 +18,10 @@
 | GPU | Pass 1 extent intervals are dispatched through an optional dynamically loaded CUDA Driver PTX collision kernel, then every candidate is revalidated on CPU. Runtime logs report the selected backend, interval count, and candidate count. CPU fallback is automatic. |
 | Parsing | `zerocopy` POD views avoid copies for supported on-disk structures. This does not make the complete I/O-to-validation pipeline zero-copy. |
 | Directories | Directory-entry, connectivity, and link-count checks plus indexed H-Tree root/node validation: depth, count/limit, ordered hashes, child bounds, duplicate references, and leaf structure. Directory index rebalancing is not performed. |
-| Journal | JBD2 header/superblock inspection plus fail-closed descriptor/tag/commit/revoke parsing into a bounded replay plan. Only committed, non-revoked writes enter the plan; automatic application remains disabled until checksum-v3 fixtures are covered. |
+| Journal | Fail-closed descriptor/tag/commit/revoke parsing into a bounded replay plan, including 64-bit block tags and checksum-v3 data verification. Only committed, non-revoked writes enter the plan. The library application path durably records each pre-image before writing and is interruption-tested; CLI application remains disabled pending broader real-image fixtures. |
 | Repair safety | Versioned, checksummed pre-mutation block images are synced before mutation. Rollback validates complete records and syncs every restored block; replay is idempotent and can restart after interruption. This is not filesystem-level transactional atomicity. |
 | UI/metrics | Summary output includes a block-group heatmap, measured scan throughput, and IOPS. `--metrics-listen HOST:PORT` exposes live Prometheus text metrics at `/metrics` while a check runs. |
-| 64-bit tracking | Block numbers are split into `HashMap<u32, RoaringBitmap>` chunks. This preserves 64-bit addresses, but exabyte-scale memory use and worst-case fragmentation have not been benchmarked. |
+| 64-bit tracking | Block numbers are split into `HashMap<u32, RoaringBitmap>` chunks. This preserves 64-bit addresses. `cargo run --release -p nexfsck-compute --example bitmap_profile -- ENTRIES STRIDE` measures elapsed time, chunk count, and RSS for dense or adversarial sparse patterns; results remain machine-specific. |
 
 The GPU probe and CPU feature detection must not be interpreted as evidence that those devices or instruction sets participated in a check. Runtime output labels them explicitly as detected capabilities only.
 

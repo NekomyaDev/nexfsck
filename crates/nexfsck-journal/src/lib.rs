@@ -24,6 +24,9 @@ pub const JBD2_FLAG_ESCAPE: u32 = 1;
 pub const JBD2_FLAG_SAME_UUID: u32 = 2;
 pub const JBD2_FLAG_DELETED: u32 = 4;
 pub const JBD2_FLAG_LAST_TAG: u32 = 8;
+pub const JBD2_FEATURE_INCOMPAT_REVOKE: u32 = 0x1;
+pub const JBD2_FEATURE_INCOMPAT_64BIT: u32 = 0x2;
+pub const JBD2_FEATURE_INCOMPAT_CSUM_V3: u32 = 0x10;
 
 #[derive(Error, Debug)]
 pub enum JournalError {
@@ -114,6 +117,42 @@ pub struct JournalReplayPlan {
     pub writes: Vec<JournalReplayWrite>,
 }
 
+/// Descriptor/revoke encoding selected from the JBD2 superblock. Unknown
+/// incompatibility bits must be rejected by the caller rather than guessed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalFeatures {
+    pub block_64bit: bool,
+    pub checksum_v3: bool,
+    pub uuid: [u8; 16],
+}
+
+impl JournalFeatures {
+    pub fn from_superblock_bytes(block: &[u8]) -> Result<Self, JournalError> {
+        if block.len() < 64 {
+            return Err(JournalError::CorruptLog(
+                "truncated JBD2 superblock features".into(),
+            ));
+        }
+        let incompat = u32::from_be_bytes(block[40..44].try_into().unwrap());
+        let supported = JBD2_FEATURE_INCOMPAT_REVOKE
+            | JBD2_FEATURE_INCOMPAT_64BIT
+            | JBD2_FEATURE_INCOMPAT_CSUM_V3;
+        if incompat & !supported != 0 {
+            return Err(JournalError::CorruptLog(format!(
+                "unsupported JBD2 incompatibility flags 0x{:x}",
+                incompat & !supported
+            )));
+        }
+        let mut uuid = [0; 16];
+        uuid.copy_from_slice(&block[48..64]);
+        Ok(Self {
+            block_64bit: incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0,
+            checksum_v3: incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0,
+            uuid,
+        })
+    }
+}
+
 /// Builds a replay plan from JBD2 log blocks. Only transactions with a matching
 /// commit record are returned; revoked and deleted blocks are excluded.
 /// Unsupported/truncated layouts fail closed instead of producing partial writes.
@@ -121,6 +160,20 @@ pub fn build_replay_plan(
     log_blocks: &[Vec<u8>],
     first_sequence: u32,
     filesystem_blocks: u64,
+) -> Result<JournalReplayPlan, JournalError> {
+    build_replay_plan_with_features(
+        log_blocks,
+        first_sequence,
+        filesystem_blocks,
+        JournalFeatures::default(),
+    )
+}
+
+pub fn build_replay_plan_with_features(
+    log_blocks: &[Vec<u8>],
+    first_sequence: u32,
+    filesystem_blocks: u64,
+    features: JournalFeatures,
 ) -> Result<JournalReplayPlan, JournalError> {
     let mut plan = JournalReplayPlan::default();
     let mut cursor = 0usize;
@@ -131,11 +184,11 @@ pub fn build_replay_plan(
             cursor += 1;
             continue;
         }
-        let tags = parse_descriptor_tags(&log_blocks[cursor])?;
+        let tags = parse_descriptor_tags(&log_blocks[cursor], features)?;
         let data_start = cursor + 1;
         let data_count = tags
             .iter()
-            .filter(|(_, flags)| flags & JBD2_FLAG_DELETED == 0)
+            .filter(|(_, flags, _)| flags & JBD2_FLAG_DELETED == 0)
             .count();
         if data_start + data_count > log_blocks.len() {
             return Err(JournalError::CorruptLog(
@@ -151,7 +204,9 @@ pub fn build_replay_plan(
                 break;
             }
             match trailer_header.block_type() {
-                JBD2_REVOKE_BLOCK => parse_revoke_block(&log_blocks[trailer], &mut revoked)?,
+                JBD2_REVOKE_BLOCK => {
+                    parse_revoke_block(&log_blocks[trailer], &mut revoked, features.block_64bit)?
+                }
                 JBD2_COMMIT_BLOCK => {
                     committed = true;
                     trailer += 1;
@@ -166,12 +221,20 @@ pub fn build_replay_plan(
             break;
         }
         let mut data_index = data_start;
-        for (target, flags) in tags {
+        for (target, flags, expected_checksum) in tags {
             if flags & JBD2_FLAG_DELETED != 0 {
                 continue;
             }
             let mut data = log_blocks[data_index].clone();
             data_index += 1;
+            if let Some(expected) = expected_checksum {
+                let actual = jbd2_tag_checksum(features.uuid, expected_sequence, &data);
+                if actual != expected {
+                    return Err(JournalError::CorruptLog(format!(
+                        "JBD2 checksum-v3 mismatch for target block {target}"
+                    )));
+                }
+            }
             if target >= filesystem_blocks {
                 return Err(JournalError::CorruptLog(format!(
                     "JBD2 target block {target} is out of bounds"
@@ -207,7 +270,10 @@ fn parse_journal_header(block: &[u8]) -> Result<Jbd2Header, JournalError> {
     Ok(*header)
 }
 
-fn parse_descriptor_tags(block: &[u8]) -> Result<Vec<(u64, u32)>, JournalError> {
+fn parse_descriptor_tags(
+    block: &[u8],
+    features: JournalFeatures,
+) -> Result<Vec<(u64, u32, Option<u32>)>, JournalError> {
     let mut tags = Vec::new();
     let mut offset = 12usize;
     loop {
@@ -216,11 +282,39 @@ fn parse_descriptor_tags(block: &[u8]) -> Result<Vec<(u64, u32)>, JournalError> 
                 "truncated JBD2 descriptor tag".into(),
             ));
         }
-        let target = u32::from_be_bytes(block[offset..offset + 4].try_into().unwrap()) as u64;
+        let mut target = u32::from_be_bytes(block[offset..offset + 4].try_into().unwrap()) as u64;
         let flags = u32::from_be_bytes(block[offset + 4..offset + 8].try_into().unwrap());
-        tags.push((target, flags));
         offset += 8;
-        if flags & JBD2_FLAG_SAME_UUID == 0 {
+        let checksum = if features.checksum_v3 {
+            if offset + 8 > block.len() {
+                return Err(JournalError::CorruptLog("truncated JBD2 v3 tag".into()));
+            }
+            if features.block_64bit {
+                target |= (u32::from_be_bytes(block[offset..offset + 4].try_into().unwrap())
+                    as u64)
+                    << 32;
+            } else if block[offset..offset + 4] != [0; 4] {
+                return Err(JournalError::CorruptLog(
+                    "non-zero high block number without JBD2 64-bit feature".into(),
+                ));
+            }
+            let checksum = u32::from_be_bytes(block[offset + 4..offset + 8].try_into().unwrap());
+            offset += 8;
+            Some(checksum)
+        } else {
+            if features.block_64bit {
+                if offset + 4 > block.len() {
+                    return Err(JournalError::CorruptLog("truncated JBD2 64-bit tag".into()));
+                }
+                target |= (u32::from_be_bytes(block[offset..offset + 4].try_into().unwrap())
+                    as u64)
+                    << 32;
+                offset += 4;
+            }
+            None
+        };
+        tags.push((target, flags, checksum));
+        if !features.checksum_v3 && flags & JBD2_FLAG_SAME_UUID == 0 {
             if offset + 16 > block.len() {
                 return Err(JournalError::CorruptLog("truncated JBD2 tag UUID".into()));
             }
@@ -236,6 +330,7 @@ fn parse_descriptor_tags(block: &[u8]) -> Result<Vec<(u64, u32)>, JournalError> 
 fn parse_revoke_block(
     block: &[u8],
     revoked: &mut std::collections::HashSet<u64>,
+    block_64bit: bool,
 ) -> Result<(), JournalError> {
     if block.len() < 16 {
         return Err(JournalError::CorruptLog(
@@ -243,15 +338,40 @@ fn parse_revoke_block(
         ));
     }
     let used = u32::from_be_bytes(block[12..16].try_into().unwrap()) as usize;
-    if used < 16 || used > block.len() || (used - 16) % 4 != 0 {
+    let entry_size = if block_64bit { 8 } else { 4 };
+    if used < 16 || used > block.len() || (used - 16) % entry_size != 0 {
         return Err(JournalError::CorruptLog(
             "invalid JBD2 revoke length".into(),
         ));
     }
-    for entry in block[16..used].chunks_exact(4) {
-        revoked.insert(u32::from_be_bytes(entry.try_into().unwrap()) as u64);
+    for entry in block[16..used].chunks_exact(entry_size) {
+        let value = if block_64bit {
+            u64::from_be_bytes(entry.try_into().unwrap())
+        } else {
+            u32::from_be_bytes(entry.try_into().unwrap()) as u64
+        };
+        revoked.insert(value);
     }
     Ok(())
+}
+
+// Linux's JBD2 v3 tag checksum: crc32c(~0, uuid), then the big-endian
+// transaction id, then the complete journal data block. Kernel CRC helpers do
+// not apply the conventional final XOR.
+fn jbd2_tag_checksum(uuid: [u8; 16], sequence: u32, data: &[u8]) -> u32 {
+    let crc = crc32c_kernel(!0, &uuid);
+    let crc = crc32c_kernel(crc, &sequence.to_be_bytes());
+    crc32c_kernel(crc, data)
+}
+
+fn crc32c_kernel(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0x82f63b78 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    crc
 }
 
 /// A rollback entry storing pre-mutation physical block data.
@@ -404,6 +524,55 @@ impl AtomicUndoJournal {
     }
 }
 
+/// Applies a validated replay plan. Every target pre-image is durably appended
+/// to `undo` before its corresponding filesystem write, and each write is
+/// synced before the next one begins.
+pub fn apply_replay_plan(
+    plan: &JournalReplayPlan,
+    dev: &BlockDevice,
+    undo: &mut AtomicUndoJournal,
+    block_size: u64,
+) -> Result<usize, JournalError> {
+    apply_replay_plan_with_limit(plan, dev, undo, block_size, None)
+}
+
+fn apply_replay_plan_with_limit(
+    plan: &JournalReplayPlan,
+    dev: &BlockDevice,
+    undo: &mut AtomicUndoJournal,
+    block_size: u64,
+    stop_after: Option<usize>,
+) -> Result<usize, JournalError> {
+    if block_size == 0 || !block_size.is_power_of_two() || block_size > 64 * 1024 {
+        return Err(JournalError::CorruptLog(format!(
+            "invalid replay block size {block_size}"
+        )));
+    }
+    let mut applied = 0;
+    for write in &plan.writes {
+        if stop_after == Some(applied) {
+            return Err(JournalError::StdIo(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "injected replay interruption",
+            )));
+        }
+        if write.data.len() != block_size as usize {
+            return Err(JournalError::CorruptLog(format!(
+                "replay data for block {} has length {}, expected {block_size}",
+                write.target_block,
+                write.data.len()
+            )));
+        }
+        let original = dev.read_block(write.target_block, block_size)?;
+        undo.record_mutation(write.target_block, &original)?;
+        dev.write_block(write.target_block, block_size, &write.data)?;
+        dev.sync_all()?;
+        applied += 1;
+    }
+    dev.flush_kernel_buffers()?;
+    Ok(applied)
+}
+
 /// Inspects the JBD2 journal from the filesystem if present.
 pub fn inspect_journal(
     dev: &BlockDevice,
@@ -447,6 +616,7 @@ pub fn inspect_journal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, OpenOptions};
 
     fn header(kind: u32, sequence: u32, size: usize) -> Vec<u8> {
         let mut block = vec![0u8; size];
@@ -499,5 +669,91 @@ mod tests {
         let plan = build_replay_plan(&[descriptor, vec![2; 64], revoke, commit], 4, 100).unwrap();
         assert_eq!(plan.committed_transactions, 1);
         assert!(plan.writes.is_empty());
+    }
+
+    #[test]
+    fn validates_checksum_v3_and_64bit_target() {
+        let features = JournalFeatures {
+            block_64bit: true,
+            checksum_v3: true,
+            uuid: *b"0123456789abcdef",
+        };
+        let sequence = 19;
+        let data = vec![0xa5; 64];
+        let target = (1u64 << 32) | 7;
+        let mut descriptor = header(JBD2_DESCRIPTOR_BLOCK, sequence, 64);
+        descriptor[12..16].copy_from_slice(&(target as u32).to_be_bytes());
+        descriptor[16..20]
+            .copy_from_slice(&(JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG).to_be_bytes());
+        descriptor[20..24].copy_from_slice(&((target >> 32) as u32).to_be_bytes());
+        descriptor[24..28]
+            .copy_from_slice(&jbd2_tag_checksum(features.uuid, sequence, &data).to_be_bytes());
+        let commit = header(JBD2_COMMIT_BLOCK, sequence, 64);
+        let plan = build_replay_plan_with_features(
+            &[descriptor.clone(), data.clone(), commit.clone()],
+            sequence,
+            target + 1,
+            features,
+        )
+        .unwrap();
+        assert_eq!(plan.writes[0].target_block, target);
+
+        let mut damaged = data;
+        damaged[31] ^= 1;
+        assert!(build_replay_plan_with_features(
+            &[descriptor, damaged, commit],
+            sequence,
+            target + 1,
+            features,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn interrupted_replay_can_be_rolled_back_from_synced_preimages() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        );
+        let image = std::env::temp_dir().join(format!("nexfsck-replay-{unique}.img"));
+        let undo_path = std::env::temp_dir().join(format!("nexfsck-replay-{unique}.undo"));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&image)
+            .unwrap();
+        file.set_len(4 * 4096).unwrap();
+        drop(file);
+        let dev = BlockDevice::open(&image, false).unwrap();
+        let original = vec![0u8; 4096];
+        let plan = JournalReplayPlan {
+            committed_transactions: 1,
+            writes: vec![
+                JournalReplayWrite {
+                    sequence: 1,
+                    target_block: 1,
+                    data: vec![1; 4096],
+                },
+                JournalReplayWrite {
+                    sequence: 1,
+                    target_block: 2,
+                    data: vec![2; 4096],
+                },
+            ],
+        };
+        let mut undo = AtomicUndoJournal::new(Some(&undo_path), 4096).unwrap();
+        assert!(apply_replay_plan_with_limit(&plan, &dev, &mut undo, 4096, Some(1)).is_err());
+        drop(undo);
+        assert_eq!(dev.read_block(1, 4096).unwrap(), vec![1; 4096]);
+        assert_eq!(dev.read_block(2, 4096).unwrap(), original);
+        assert_eq!(
+            AtomicUndoJournal::rollback_from_file(&undo_path, &dev).unwrap(),
+            1
+        );
+        assert_eq!(dev.read_block(1, 4096).unwrap(), vec![0; 4096]);
+        let _ = fs::remove_file(image);
+        let _ = fs::remove_file(undo_path);
     }
 }
