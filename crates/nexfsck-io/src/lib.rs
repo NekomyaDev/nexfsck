@@ -7,8 +7,12 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use zerocopy::FromBytes;
+
+pub mod uring;
+pub use uring::{BatchReadRequest, BatchReadResult, IoUringEngine};
 
 use nexfsck_core::{
     CoreError, Ext4GroupDesc, Ext4Inode, Ext4Superblock, EXT4_SUPERBLOCK_OFFSET,
@@ -36,16 +40,20 @@ pub enum IoError {
     },
 }
 
-/// Linux block device handle equipped with safe Direct I/O and cache invalidation.
+/// Linux block device handle equipped with safe Direct I/O, cache invalidation,
+/// asynchronous io_uring batching, and media error isolation tracking.
 pub struct BlockDevice {
     file: File,
     path: String,
     read_only: bool,
+    uring: Option<IoUringEngine>,
+    media_errors: AtomicU64,
 }
 
 impl BlockDevice {
     /// Opens the specified block device or disk image.
     /// Executes mandatory cache flush (`ioctl BLKFLSBUF`) to avoid reading stale cache lines.
+    /// Initializes an asynchronous Linux `io_uring` engine if supported by the kernel and environment.
     pub fn open<P: AsRef<Path>>(path: P, read_only: bool) -> Result<Self, IoError> {
         let path_str = path.as_ref().to_string_lossy().to_string();
         let file = OpenOptions::new()
@@ -53,10 +61,14 @@ impl BlockDevice {
             .write(!read_only)
             .open(&path)?;
 
+        let uring = IoUringEngine::try_new(file.as_raw_fd(), 128);
+
         let dev = Self {
             file,
             path: path_str,
             read_only,
+            uring,
+            media_errors: AtomicU64::new(0),
         };
 
         // Invalidate OS buffer cache to prevent stale data incoherency
@@ -226,6 +238,7 @@ impl BlockDevice {
                         offset,
                         e
                     );
+                    self.media_errors.fetch_add(1, Ordering::Relaxed);
                     buf.fill(0);
                     Ok(())
                 } else {
@@ -310,5 +323,64 @@ impl BlockDevice {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Number of physical bad sectors isolated during reads.
+    pub fn media_errors(&self) -> u64 {
+        self.media_errors.load(Ordering::Relaxed)
+    }
+
+    /// True if Linux `io_uring` kernel submission queue is active.
+    pub fn is_io_uring_active(&self) -> bool {
+        self.uring.is_some()
+    }
+
+    /// Reads multiple blocks in parallel using Linux `io_uring` if active,
+    /// or falls back to direct resilient reads with zero runtime crash risk.
+    pub fn read_blocks_batch(
+        &self,
+        blocks: &[u64],
+        block_size: u64,
+    ) -> Vec<(u64, Result<Vec<u8>, IoError>)> {
+        if blocks.is_empty() {
+            return Vec::new();
+        }
+
+        if let Some(ref uring) = self.uring {
+            let requests: Vec<BatchReadRequest> = blocks
+                .iter()
+                .map(|&blk| BatchReadRequest {
+                    id: blk,
+                    offset: blk * block_size,
+                    len: block_size as usize,
+                })
+                .collect();
+
+            let batch_results = uring.read_batch(&requests);
+            let mut final_results = Vec::with_capacity(blocks.len());
+
+            for res in batch_results {
+                match res.data {
+                    Ok(data) => final_results.push((res.id, Ok(data))),
+                    Err(e) => {
+                        // Fall back to resilient bisection read for corrupted/short blocks
+                        tracing::debug!(
+                            "Block {} failed under io_uring ({}): retrying via resilient bisection reader",
+                            res.id,
+                            e
+                        );
+                        let fallback_res = self.read_block(res.id, block_size);
+                        final_results.push((res.id, fallback_res));
+                    }
+                }
+            }
+
+            final_results
+        } else {
+            blocks
+                .iter()
+                .map(|&blk| (blk, self.read_block(blk, block_size)))
+                .collect()
+        }
     }
 }

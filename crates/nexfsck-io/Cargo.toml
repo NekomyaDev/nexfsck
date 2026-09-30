@@ -11,3 +11,4 @@ zerocopy.workspace = true
 libc.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+io-uring = { workspace = true }

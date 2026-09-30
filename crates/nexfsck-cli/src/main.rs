@@ -4,12 +4,11 @@ use clap::Parser;
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use tracing::{debug, error, info, warn};
-use zerocopy::FromBytes;
 
 use nexfsck_compute::{
-    reconcile_block_bitmap, reconcile_inode_bitmap, verify_directory_block_detailed,
-    verify_inodes_parallel, BitmapDiscrepancy, BlockAllocationTracker, HardwareProfile,
-    InodeBitmapDiscrepancy, InodeVerificationStats,
+    collect_directory_blocks, reconcile_block_bitmap, reconcile_inode_bitmap,
+    verify_directory_block_detailed, verify_inodes_parallel, BitmapDiscrepancy,
+    BlockAllocationTracker, HardwareProfile, InodeBitmapDiscrepancy, InodeVerificationStats,
 };
 use nexfsck_gpu::GpuAccelerator;
 use nexfsck_io::BlockDevice;
@@ -128,9 +127,6 @@ fn main() -> ExitCode {
 
     // 2. Open Block Device & Flush Cache
     let is_read_only = !args.repair;
-    if !args.json {
-        info!("Opening target storage: {} (read_only = {})", args.device, is_read_only);
-    }
     let dev = match BlockDevice::open(&args.device, is_read_only) {
         Ok(d) => d,
         Err(e) => {
@@ -138,6 +134,10 @@ fn main() -> ExitCode {
             return ExitCode::from(FSCK_EXIT_OPERATIONAL_ERROR);
         }
     };
+    if !args.json {
+        info!("Opening target storage: {} (read_only = {})", args.device, is_read_only);
+        info!("I/O Engine        : Linux io_uring (Queue Depth 128) [Active: {}]", dev.is_io_uring_active());
+    }
 
     // 3. Read Superblock (Primary or Backup Hunter)
     let sb = if let Some(blk) = args.backup_sb {
@@ -286,13 +286,12 @@ fn main() -> ExitCode {
 
                 for (i, inode) in inodes.iter().enumerate() {
                     let ino_num = (bg_idx as u32) * sb.inodes_per_group() + (i as u32) + 1;
-                    if inode.is_used() && inode.is_dir() && inode.uses_extents() {
-                        if let Some(hdr) = inode.extent_header() {
-                            if hdr.depth() == 0 && hdr.entries() > 0 {
-                                if let Ok((ext, _)) = nexfsck_core::Ext4Extent::ref_from_prefix(&inode.i_block[12..]) {
-                                    directory_blocks_to_check.push((ino_num, ext.physical_start()));
-                                }
-                            }
+                    if inode.is_used() && inode.is_dir() {
+                        let blocks = collect_directory_blocks(inode, &|blk| {
+                            dev.read_block(blk, block_size).ok()
+                        });
+                        for blk in blocks {
+                            directory_blocks_to_check.push((ino_num, blk));
                         }
                     }
                 }
@@ -323,9 +322,24 @@ fn main() -> ExitCode {
 
     reachable_from_dir.insert(nexfsck_core::EXT4_ROOT_INO);
 
+    let blocks_to_fetch: Vec<u64> = directory_blocks_to_check.iter().map(|(_, b)| *b).collect();
+    let batch_reads = dev.read_blocks_batch(&blocks_to_fetch, block_size);
+    let mut block_cache: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::with_capacity(batch_reads.len());
+    for (blk, res) in batch_reads {
+        match res {
+            Ok(bytes) => {
+                block_cache.insert(blk, bytes);
+            }
+            Err(e) => {
+                warn!("Failed to read directory block {}: {}", blk, e);
+                inode_stats.corrupt_directories.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     for (_dir_ino, dir_block) in directory_blocks_to_check {
-        if let Ok(block_bytes) = dev.read_block(dir_block, block_size) {
-            let res = verify_directory_block_detailed(&block_bytes, sb.total_inodes());
+        if let Some(block_bytes) = block_cache.get(&dir_block) {
+            let res = verify_directory_block_detailed(block_bytes, sb.total_inodes());
             total_dentry_count += res.entries.len();
             if res.corrupt_entries > 0 {
                 inode_stats.corrupt_directories.fetch_add(res.corrupt_entries, Ordering::Relaxed);
@@ -427,7 +441,7 @@ fn main() -> ExitCode {
     let orphan_dirs = inode_stats.orphan_directories.load(Ordering::Relaxed);
     let link_mismatches = inode_stats.link_count_mismatches.load(Ordering::Relaxed);
 
-    stats.errors_found += corruptions + duplicates + oob + corrupt_symlinks + corrupt_dirs + orphan_dirs + link_mismatches + total_block_discrepancy.false_free_blocks + total_inode_discrepancy.false_free_inodes;
+    stats.errors_found += corruptions + duplicates + oob + corrupt_symlinks + corrupt_dirs + orphan_dirs + link_mismatches + total_block_discrepancy.false_free_blocks + total_inode_discrepancy.false_free_inodes + dev.media_errors();
 
     // 6. Active Repair Mode Execution
     let mut errors_were_corrected = false;
@@ -462,11 +476,21 @@ fn main() -> ExitCode {
                         }
 
                         if modified {
-                            let orig_bm = dev.read_block_bitmap(desc, is_64bit, block_size).unwrap_or_default();
-                            let _ = undo_journal.record_mutation(desc.block_bitmap(is_64bit), &orig_bm);
-                            if dev.write_block(desc.block_bitmap(is_64bit), block_size, &disk_bm).is_ok() {
-                                debug!("Repaired block bitmap for group {}", bg_idx);
-                                errors_were_corrected = true;
+                            match dev.read_block_bitmap(desc, is_64bit, block_size) {
+                                Ok(orig_bm) if !orig_bm.is_empty() => {
+                                    if let Err(e) = undo_journal.record_mutation(desc.block_bitmap(is_64bit), &orig_bm) {
+                                        error!("Failed to record undo journal for group {}: {}. Aborting block mutation for safety.", bg_idx, e);
+                                        continue;
+                                    }
+                                    if dev.write_block(desc.block_bitmap(is_64bit), block_size, &disk_bm).is_ok() {
+                                        debug!("Repaired block bitmap for group {}", bg_idx);
+                                        errors_were_corrected = true;
+                                    }
+                                }
+                                _ => {
+                                    error!("Failed to read pristine block bitmap for group {}. Aborting repair for safety.", bg_idx);
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -491,11 +515,21 @@ fn main() -> ExitCode {
                             }
 
                             if modified {
-                                let orig_inomb = dev.read_inode_bitmap(desc, is_64bit, block_size).unwrap_or_default();
-                                let _ = undo_journal.record_mutation(desc.inode_bitmap(is_64bit), &orig_inomb);
-                                if dev.write_block(desc.inode_bitmap(is_64bit), block_size, &disk_inomb).is_ok() {
-                                    debug!("Repaired inode bitmap for group {}", bg_idx);
-                                    errors_were_corrected = true;
+                                match dev.read_inode_bitmap(desc, is_64bit, block_size) {
+                                    Ok(orig_inomb) if !orig_inomb.is_empty() => {
+                                        if let Err(e) = undo_journal.record_mutation(desc.inode_bitmap(is_64bit), &orig_inomb) {
+                                            error!("Failed to record undo journal for group {}: {}. Aborting inode mutation for safety.", bg_idx, e);
+                                            continue;
+                                        }
+                                        if dev.write_block(desc.inode_bitmap(is_64bit), block_size, &disk_inomb).is_ok() {
+                                            debug!("Repaired inode bitmap for group {}", bg_idx);
+                                            errors_were_corrected = true;
+                                        }
+                                    }
+                                    _ => {
+                                        error!("Failed to read pristine inode bitmap for group {}. Aborting repair for safety.", bg_idx);
+                                        continue;
+                                    }
                                 }
                             }
                         }

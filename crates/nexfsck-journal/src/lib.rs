@@ -138,6 +138,12 @@ impl AtomicUndoJournal {
         physical_block: u64,
         original_data: &[u8],
     ) -> Result<(), JournalError> {
+        if original_data.is_empty() {
+            return Err(JournalError::CorruptLog(
+                "Attempted to record empty mutation into undo journal".into(),
+            ));
+        }
+
         let entry = UndoEntry {
             physical_block,
             original_data: original_data.to_vec(),
@@ -148,6 +154,7 @@ impl AtomicUndoJournal {
             f.write_all(&(original_data.len() as u32).to_le_bytes())?;
             f.write_all(original_data)?;
             f.flush()?;
+            f.sync_all()?;
         }
 
         self.entries.push(entry);

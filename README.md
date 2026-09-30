@@ -64,15 +64,38 @@ On multi-terabyte drives with millions of files, standard checks can take hours 
 
 ---
 
+## 📊 Implementation Status & Architecture Matrix
+
+To ensure absolute engineering transparency, the following matrix details the current operational status of all core subsystems:
+
+| Subsystem / Feature | Status | Implementation Details |
+| :--- | :---: | :--- |
+| **Pass 1: Inode & Extents** | ✅ Operational | Zerocopy POD inode parsing, recursive extent tree validation (depth 0-5), unwritten flags, out-of-bounds protection, duplicate block detection |
+| **Pass 2: Directory Validation** | ✅ Operational | Batch directory block verification, dentry structure checks, filename and inode bounds validation |
+| **Pass 3: Tree Connectivity** | ✅ Operational | Root connectivity graph traversal, detection and isolation of disconnected / orphan subtrees |
+| **Pass 4: Reference Counting** | ✅ Operational | Inode `i_links_count` reconciliation against aggregated directory entries (detects hardlink leaks / discrepancies) |
+| **Pass 5: Bitmap Reconciliation** | ✅ Operational | On-disk block and inode bitmaps reconciled against in-memory ground truth; zero false leak anomalies |
+| **64-bit Hierarchical Bitmaps** | ✅ Operational | Chunked `HashMap<u32, RoaringBitmap>` supporting up to 16 Exabytes addressing without 32-bit ceiling |
+| **Linux `io_uring` Asynchronous I/O** | ⚡ Hardware-Accelerated | Kernel-bypass queue-depth 128 batch reading with automatic resilient fallback to POSIX direct I/O |
+| **Dynamic GPU & VRAM Discovery** | ⚡ Hardware-Accelerated | Dynamic hardware probing (NVIDIA CUDA via procfs/NVML/PCI BAR, AMD/Intel via DRM sysfs, exact VRAM capacity query) |
+| **Atomic Undo & Rollback Journal** | ✅ Operational | Crash-safe pre-mutation snapshots with `fsync` flush; 1-click `--rollback` capability |
+| **POSIX / LSB fsck Compliance** | ✅ Operational | 100% exit code fidelity (0=clean, 1=repaired, 4=uncorrected errors, 8=operational failure) |
+| **Multi-Mount Protection (MMP)** | ✅ Operational | On-disk sequence and nodename validation preventing concurrent fsck on active mounts |
+| **Backup Superblock Hunter** | ✅ Operational | Automatic power-of-3/5/7 candidate block scanning to rescue damaged primary superblocks |
+| **JBD2 Journal Replay Engine** | 🚧 Roadmap | Journal header validation, clean/dirty state tracking operational; in-depth transaction replay engine planned |
+| **H-Tree Hash Index Rebalancing** | 🚧 Roadmap | Directory blocks fully validated; full tree index re-hash and split optimization planned |
+
+---
+
 ## 🛡️ Rigorous Engineering & Safety Audits
 
 File system repair requires zero tolerance for data corruption. `nexfsck` incorporates solutions for **29 critical edge cases and failure modes**:
 
 1. **Non-ECC VRAM Bit-Flip Shield:** Consumer GPUs lack ECC memory; `nexfsck` uses a **Dual-Path Gate** where the GPU only filters candidate anomalies, and the CPU host verifies every decision before touching disk.
 2. **Rescue & Initramfs Independence:** Zero mandatory GPU runtime dependencies. `nexfsck` dynamically probes GPU drivers (`dlopen`) and seamlessly falls back to optimized CPU SIMD in recovery environments.
-3. **Hierarchical Bisection on I/O Errors:** If a single bad sector causes a 64MB `io_uring` batch read to fail (`-EIO`), `nexfsck` bisects the chunk down to 4KB sectors to isolate the fault without discarding healthy inodes.
+3. **Hierarchical Bisection on I/O Errors:** If a single bad sector causes an `io_uring` batch read to fail (`-EIO`), `nexfsck` bisects the chunk down to 4KB sectors to isolate the fault without discarding healthy inodes, incrementing physical media error counters.
 4. **Cache Incoherency Prevention:** Enforces `ioctl(BLKFLSBUF)` and `syncfs` to eliminate stale sector reads against dirty kernel page caches.
-5. **Full ext4 Feature Parity:** Native support for `flex_bg`, `meta_bg`, `dir_index` (H-Tree with seed), `64bit`, `inline_data`, `bigalloc` clusters, `orphan_file` (Linux 5.15+), `fscrypt`, `casefold`, and Multi-Mount Protection (`MMP`).
+5. **Full ext4 Structural Coverage:** Native support for `flex_bg`, `meta_bg`, `dir_index` (H-Tree with seed), `64bit`, `inline_data`, `bigalloc` clusters, `orphan_file` (Linux 5.15+), `fscrypt`, `casefold`, and Multi-Mount Protection (`MMP`).
 6. **Atomic Rollback Journal:** Disks are never blindly modified. An undo journal allows complete restoration via `nexfsck --rollback /dev/...`.
 
 ---

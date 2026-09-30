@@ -7,6 +7,7 @@
 use crc32fast::Hasher;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use zerocopy::FromBytes;
@@ -114,11 +115,12 @@ impl InodeVerificationStats {
     }
 }
 
-/// High-performance thread-safe block allocation tracker using Roaring Bitmaps.
+/// High-performance thread-safe 64-bit block allocation tracker using hierarchical Roaring Bitmaps.
+/// Supports arbitrary 64-bit block addresses (up to 16 Exabytes) with zero truncation.
 pub struct BlockAllocationTracker {
     total_blocks: u64,
     allocated_count: AtomicU64,
-    pub bitmap: RwLock<RoaringBitmap>,
+    pub chunks: RwLock<HashMap<u32, RoaringBitmap>>,
 }
 
 impl BlockAllocationTracker {
@@ -126,22 +128,25 @@ impl BlockAllocationTracker {
         Self {
             total_blocks,
             allocated_count: AtomicU64::new(0),
-            bitmap: RwLock::new(RoaringBitmap::new()),
+            chunks: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Marks a range of blocks as allocated. Returns true if no collision detected.
+    /// Marks a range of 64-bit blocks as allocated. Returns true if no collision detected.
     pub fn mark_range(&self, start_block: u64, count: u32) -> bool {
-        let mut bm = self.bitmap.write().unwrap();
+        let mut chunks = self.chunks.write().unwrap();
         let mut collision = false;
         let mut newly_added = 0u64;
+
         for b in start_block..(start_block + count as u64) {
-            if b < u32::MAX as u64 {
-                if !bm.insert(b as u32) {
-                    collision = true;
-                } else {
-                    newly_added += 1;
-                }
+            let chunk_idx = (b >> 32) as u32;
+            let offset = (b & 0xFFFF_FFFF) as u32;
+
+            let bm = chunks.entry(chunk_idx).or_insert_with(RoaringBitmap::new);
+            if !bm.insert(offset) {
+                collision = true;
+            } else {
+                newly_added += 1;
             }
         }
         self.allocated_count.fetch_add(newly_added, Ordering::Relaxed);
@@ -157,11 +162,15 @@ impl BlockAllocationTracker {
     }
 
     pub fn is_allocated(&self, block: u64) -> bool {
-        if block >= u32::MAX as u64 {
-            return false;
+        let chunk_idx = (block >> 32) as u32;
+        let offset = (block & 0xFFFF_FFFF) as u32;
+
+        let chunks = self.chunks.read().unwrap();
+        if let Some(bm) = chunks.get(&chunk_idx) {
+            bm.contains(offset)
+        } else {
+            false
         }
-        let bm = self.bitmap.read().unwrap();
-        bm.contains(block as u32)
     }
 }
 
@@ -370,7 +379,7 @@ pub fn reconcile_block_bitmap(
     blocks_in_group: u32,
 ) -> BitmapDiscrepancy {
     let mut discrepancy = BitmapDiscrepancy::default();
-    let bm = tracker.bitmap.read().unwrap();
+    let chunks = tracker.chunks.read().unwrap();
 
     for i in 0..blocks_in_group {
         let abs_block = first_block_in_group + i as u64;
@@ -383,11 +392,9 @@ pub fn reconcile_block_bitmap(
             false
         };
 
-        let tracker_is_allocated = if abs_block < u32::MAX as u64 {
-            bm.contains(abs_block as u32)
-        } else {
-            false
-        };
+        let chunk_idx = (abs_block >> 32) as u32;
+        let offset = (abs_block & 0xFFFF_FFFF) as u32;
+        let tracker_is_allocated = chunks.get(&chunk_idx).map(|bm| bm.contains(offset)).unwrap_or(false);
 
         if tracker_is_allocated && !disk_is_allocated {
             discrepancy.false_free_blocks += 1;
@@ -464,4 +471,88 @@ pub fn verify_directory_block_detailed(
 pub fn verify_directory_block(block_bytes: &[u8]) -> Vec<(u32, String)> {
     verify_directory_block_detailed(block_bytes, u32::MAX).entries
 }
+
+/// Recursively collects all physical block numbers allocated to a directory inode across all extent tree depths.
+pub fn collect_directory_blocks<F>(
+    inode: &Ext4Inode,
+    read_block_fn: &F,
+) -> Vec<u64>
+where
+    F: Fn(u64) -> Option<Vec<u8>>,
+{
+    let mut blocks = Vec::new();
+
+    if inode.uses_extents() && !inode.is_inline_data() {
+        collect_directory_blocks_from_extent(&inode.i_block, read_block_fn, 0, &mut blocks);
+    } else if !inode.is_inline_data() && !inode.is_fast_symlink() {
+        for chunk in inode.i_block.chunks_exact(4) {
+            let blk = u32::from_le_bytes(chunk.try_into().unwrap()) as u64;
+            if blk != 0 {
+                blocks.push(blk);
+            }
+        }
+    }
+
+    blocks
+}
+
+fn collect_directory_blocks_from_extent<F>(
+    data: &[u8],
+    read_block_fn: &F,
+    current_depth: u16,
+    blocks: &mut Vec<u64>,
+) where
+    F: Fn(u64) -> Option<Vec<u8>>,
+{
+    if current_depth > 5 {
+        return;
+    }
+
+    let (header, rest) = match Ext4ExtentHeader::ref_from_prefix(data) {
+        Ok(res) => res,
+        Err(_) => return,
+    };
+
+    if !header.is_valid_magic() {
+        return;
+    }
+
+    let entries = header.entries() as usize;
+    let max_entries = header.max() as usize;
+    if entries > max_entries {
+        return;
+    }
+
+    if header.depth() == 0 {
+        let extent_size = std::mem::size_of::<Ext4Extent>();
+        for i in 0..entries {
+            let offset = i * extent_size;
+            if offset + extent_size > rest.len() {
+                break;
+            }
+            if let Ok((ext, _)) = Ext4Extent::ref_from_prefix(&rest[offset..]) {
+                let start = ext.physical_start();
+                let count = ext.block_count();
+                for b in 0..count {
+                    blocks.push(start + b as u64);
+                }
+            }
+        }
+    } else {
+        let idx_size = std::mem::size_of::<Ext4ExtentIdx>();
+        for i in 0..entries {
+            let offset = i * idx_size;
+            if offset + idx_size > rest.len() {
+                break;
+            }
+            if let Ok((idx, _)) = Ext4ExtentIdx::ref_from_prefix(&rest[offset..]) {
+                let child = idx.child_block();
+                if let Some(child_data) = read_block_fn(child) {
+                    collect_directory_blocks_from_extent(&child_data, read_block_fn, current_depth + 1, blocks);
+                }
+            }
+        }
+    }
+}
+
 
