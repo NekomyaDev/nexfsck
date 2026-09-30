@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 nexfsck-core = { path = "../nexfsck-core" }
 tracing.workspace = true
+libc.workspace = true

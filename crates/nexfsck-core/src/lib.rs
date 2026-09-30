@@ -3,8 +3,8 @@
 //! Core types, zerocopy Plain-Old-Data (POD) on-disk layouts, and parsing
 //! logic for the Linux ext4 filesystem.
 
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use thiserror::Error;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Standard ext2/3/4 magic number (0xEF53).
 pub const EXT4_SUPER_MAGIC: u16 = 0xEF53;
@@ -484,6 +484,10 @@ impl Ext4Inode {
 
     pub fn is_inline_data(&self) -> bool {
         (self.flags() & EXT4_INLINE_DATA_FL) != 0
+    }
+
+    pub fn is_indexed_directory(&self) -> bool {
+        self.is_dir() && (self.flags() & EXT4_INDEX_FL) != 0
     }
 
     pub fn file_size(&self) -> u64 {

@@ -1,14 +1,18 @@
 //! `nexfsck-gpu`
 //!
-//! Dynamic GPU accelerator interface (Vulkan / CUDA / ROCm) with
-//! zero runtime crash risk (dlopen probed) and dual-path compute validation.
+//! GPU device discovery.
+//!
+//! CUDA collision candidates are produced by a PTX kernel and revalidated on CPU.
 
-/// GPU acceleration backend type.
+#[cfg(target_os = "linux")]
+mod cuda;
+
+/// Detected GPU device family. This does not indicate an active compute backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuBackend {
     None,
-    VulkanCompute,
-    Cuda,
+    DrmDeviceDetected,
+    CudaCompute,
 }
 
 /// A block interval representing contiguous physical blocks.
@@ -18,40 +22,46 @@ pub struct BlockInterval {
     pub block_count: u32,
 }
 
-/// Dynamic GPU runtime accelerator.
+/// GPU device probe with CPU interval processing.
 pub struct GpuAccelerator {
     backend: GpuBackend,
     device_name: String,
     vram_bytes: u64,
+    #[cfg(target_os = "linux")]
+    cuda: Option<cuda::CudaContext>,
 }
 
 impl GpuAccelerator {
-    /// Probes the system for available GPU compute backends dynamically querying
-    /// device model and real physical VRAM capacity from sysfs, procfs, or driver queries.
+    /// Probes for visible GPU devices and queries model/memory information where possible.
     pub fn probe() -> Self {
         #[cfg(target_os = "linux")]
         {
-            if let Some((model, vram)) = probe_nvidia() {
+            if let Ok(cuda) = cuda::CudaContext::new() {
+                let (model, vram) = probe_nvidia().unwrap_or_else(|| ("NVIDIA CUDA GPU".into(), 0));
                 return Self {
-                    backend: GpuBackend::Cuda,
+                    backend: GpuBackend::CudaCompute,
                     device_name: model,
                     vram_bytes: vram,
+                    cuda: Some(cuda),
                 };
             }
 
             if let Some((model, vram)) = probe_drm_vulkan() {
                 return Self {
-                    backend: GpuBackend::VulkanCompute,
+                    backend: GpuBackend::DrmDeviceDetected,
                     device_name: model,
                     vram_bytes: vram,
+                    cuda: None,
                 };
             }
         }
 
         Self {
             backend: GpuBackend::None,
-            device_name: "None (CPU SIMD Fallback Active)".into(),
+            device_name: "No GPU device detected".into(),
             vram_bytes: 0,
+            #[cfg(target_os = "linux")]
+            cuda: None,
         }
     }
 
@@ -67,12 +77,12 @@ impl GpuAccelerator {
         self.vram_bytes
     }
 
+    /// Returns whether a real CUDA compute context is active.
     pub fn is_available(&self) -> bool {
-        self.backend != GpuBackend::None
+        self.backend == GpuBackend::CudaCompute
     }
 
-    /// Accelerates batch interval sorting and overlap detection.
-    /// If GPU compute is not active, executes high-throughput in-memory parallel sort.
+    /// Sorts intervals and detects adjacent overlaps on the CPU.
     pub fn find_interval_collisions(
         &self,
         intervals: &mut [BlockInterval],
@@ -81,15 +91,34 @@ impl GpuAccelerator {
             return Vec::new();
         }
 
-        // Sort intervals by start_block
+        // Sorting remains on the host; collision candidate generation is dispatched
+        // to CUDA when available and deterministically revalidated on the CPU.
         intervals.sort_unstable_by_key(|i| i.start_block);
+
+        #[cfg(target_os = "linux")]
+        if let Some(cuda) = &self.cuda {
+            if let Ok(candidate_indices) = cuda.find_collision_candidates(intervals) {
+                return candidate_indices
+                    .into_iter()
+                    .filter_map(|index| {
+                        let current = intervals.get(index).copied()?;
+                        let next = intervals.get(index + 1).copied()?;
+                        (current
+                            .start_block
+                            .saturating_add(current.block_count as u64)
+                            > next.start_block)
+                            .then_some((current, next))
+                    })
+                    .collect();
+            }
+        }
 
         let mut collisions = Vec::new();
         for i in 0..intervals.len() - 1 {
             let curr = intervals[i];
             let next = intervals[i + 1];
 
-            if curr.start_block + curr.block_count as u64 > next.start_block {
+            if curr.start_block.saturating_add(curr.block_count as u64) > next.start_block {
                 collisions.push((curr, next));
             }
         }
@@ -100,7 +129,9 @@ impl GpuAccelerator {
 
 #[cfg(target_os = "linux")]
 fn probe_nvidia() -> Option<(String, u64)> {
-    if !std::path::Path::new("/dev/nvidia0").exists() && !std::path::Path::new("/dev/nvidiactl").exists() {
+    if !std::path::Path::new("/dev/nvidia0").exists()
+        && !std::path::Path::new("/dev/nvidiactl").exists()
+    {
         return None;
     }
 
@@ -191,7 +222,11 @@ fn probe_drm_vulkan() -> Option<(String, u64)> {
     if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.file_name().and_then(|n| n.to_str()).map_or(false, |s| s.starts_with("card")) {
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |s| s.starts_with("card"))
+            {
                 let vram_path = path.join("device/mem_info_vram_total");
                 if let Ok(content) = std::fs::read_to_string(&vram_path) {
                     if let Ok(bytes) = content.trim().parse::<u64>() {
@@ -215,4 +250,43 @@ fn probe_drm_vulkan() -> Option<(String, u64)> {
     }
 
     Some((model_name, vram_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collision_detection_is_deterministic() {
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("NEXFSCK_REQUIRE_CUDA").is_some() {
+            cuda::CudaContext::new().expect("CUDA context and PTX module must initialize");
+        }
+        let accelerator = GpuAccelerator::probe();
+        if std::env::var_os("NEXFSCK_REQUIRE_CUDA").is_some() {
+            assert_eq!(accelerator.backend(), GpuBackend::CudaCompute);
+        }
+        let mut intervals = [
+            BlockInterval {
+                start_block: 20,
+                block_count: 2,
+            },
+            BlockInterval {
+                start_block: 10,
+                block_count: 5,
+            },
+            BlockInterval {
+                start_block: 14,
+                block_count: 3,
+            },
+            BlockInterval {
+                start_block: 30,
+                block_count: 1,
+            },
+        ];
+        let collisions = accelerator.find_interval_collisions(&mut intervals);
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].0.start_block, 10);
+        assert_eq!(collisions[0].1.start_block, 14);
+    }
 }

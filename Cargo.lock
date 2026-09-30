@@ -247,7 +247,6 @@ dependencies = [
 name = "nexfsck-compute"
 version = "0.1.0"
 dependencies = [
- "crc32fast",
  "nexfsck-core",
  "rayon",
  "roaring",
@@ -271,6 +270,7 @@ dependencies = [
 name = "nexfsck-gpu"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nexfsck-core",
  "tracing",
 ]
@@ -291,6 +291,7 @@ dependencies = [
 name = "nexfsck-journal"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "nexfsck-core",
  "nexfsck-io",
  "thiserror",

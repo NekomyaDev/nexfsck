@@ -44,9 +44,7 @@ fn test_corrupted_magic_detection() {
         .args(&["-s", "32M", img_path])
         .status();
 
-    let _ = Command::new("mkfs.ext4")
-        .args(&["-F", img_path])
-        .status();
+    let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
 
     // 2. Corrupt superblock magic (offset 1024 + 56 in ext4 superblock)
     let mut file = OpenOptions::new()
@@ -86,12 +84,14 @@ fn test_atomic_rollback_and_restore() {
         .args(&["-s", "32M", img_path])
         .status();
 
-    let _ = Command::new("mkfs.ext4")
-        .args(&["-F", img_path])
-        .status();
+    let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
 
     // 2. Save block 0 (original data containing valid superblock) into undo journal
-    let mut dev_file = OpenOptions::new().read(true).write(true).open(img_path).unwrap();
+    let mut dev_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(img_path)
+        .unwrap();
     let mut original_block_0 = vec![0u8; 4096];
     dev_file.read_exact(&mut original_block_0).unwrap();
 
@@ -137,7 +137,9 @@ fn test_json_telemetry_output() {
     let img_path = "/tmp/test_json.img";
     let _ = std::fs::remove_file(img_path);
 
-    let _ = Command::new("truncate").args(&["-s", "32M", img_path]).status();
+    let _ = Command::new("truncate")
+        .args(&["-s", "32M", img_path])
+        .status();
     let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
 
     let nexfsck_bin = env!("CARGO_BIN_EXE_nexfsck");
@@ -165,12 +167,18 @@ fn test_active_repair_false_free_block() {
     let _ = std::fs::remove_file(undo_file);
 
     // 1. Create clean ext4 filesystem
-    let _ = Command::new("truncate").args(&["-s", "32M", img_path]).status();
+    let _ = Command::new("truncate")
+        .args(&["-s", "32M", img_path])
+        .status();
     let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
 
     // 2. Artificially clear a bit in block bitmap (block 5 is block bitmap in group 0)
     // Clear bit 0 of block 0 (superblock) so it becomes a false-free block
-    let mut file = OpenOptions::new().read(true).write(true).open(img_path).unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(img_path)
+        .unwrap();
     // Seek to block bitmap at block 5 (5 * 4096 = 20480)
     file.seek(SeekFrom::Start(5 * 4096)).unwrap();
     let mut bm_byte = [0u8; 1];
@@ -218,11 +226,17 @@ fn test_active_repair_false_free_inode() {
     let _ = std::fs::remove_file(undo_file);
 
     // 1. Create clean ext4 filesystem
-    let _ = Command::new("truncate").args(&["-s", "32M", img_path]).status();
+    let _ = Command::new("truncate")
+        .args(&["-s", "32M", img_path])
+        .status();
     let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
 
     // 2. Artificially clear bit 1 (inode 2) in inode bitmap (block 21 in 32M ext4)
-    let mut file = OpenOptions::new().read(true).write(true).open(img_path).unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(img_path)
+        .unwrap();
     file.seek(SeekFrom::Start(21 * 4096)).unwrap();
     let mut bm_byte = [0u8; 1];
     file.read_exact(&mut bm_byte).unwrap();
@@ -266,12 +280,18 @@ fn test_corrupt_directory_entry_detection() {
     let _ = std::fs::remove_file(img_path);
 
     // 1. Create clean ext4 filesystem
-    let _ = Command::new("truncate").args(&["-s", "32M", img_path]).status();
+    let _ = Command::new("truncate")
+        .args(&["-s", "32M", img_path])
+        .status();
     let _ = Command::new("mkfs.ext4").args(&["-F", img_path]).status();
 
     // 2. Corrupt root directory block (block 6 at offset 24576):
     // Inject invalid unaligned rec_len (e.g. 5 bytes instead of 12) at offset 24576 + 4
-    let mut file = OpenOptions::new().read(true).write(true).open(img_path).unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(img_path)
+        .unwrap();
     file.seek(SeekFrom::Start(6 * 4096 + 4)).unwrap();
     let bad_rec_len = [0x05u8, 0x00u8]; // Invalid unaligned record length
     file.write_all(&bad_rec_len).unwrap();
@@ -290,5 +310,3 @@ fn test_corrupt_directory_entry_detection() {
     // Cleanup
     let _ = std::fs::remove_file(img_path);
 }
-
-

@@ -34,10 +34,7 @@ pub enum IoError {
     DeviceSize(String),
 
     #[error("Unrecoverable media read error at offset {offset}: {source}")]
-    MediaError {
-        offset: u64,
-        source: std::io::Error,
-    },
+    MediaError { offset: u64, source: std::io::Error },
 }
 
 /// Linux block device handle equipped with safe Direct I/O, cache invalidation,
@@ -92,10 +89,11 @@ impl BlockDevice {
     /// Reads the primary ext4 superblock at offset 1024 bytes.
     pub fn read_superblock(&self) -> Result<Ext4Superblock, IoError> {
         let mut buffer = [0u8; EXT4_SUPERBLOCK_SIZE];
-        self.file.read_exact_at(&mut buffer, EXT4_SUPERBLOCK_OFFSET)?;
+        self.file
+            .read_exact_at(&mut buffer, EXT4_SUPERBLOCK_OFFSET)?;
 
-        let (sb, _) = Ext4Superblock::ref_from_prefix(&buffer)
-            .map_err(|_| CoreError::BufferTooSmall {
+        let (sb, _) =
+            Ext4Superblock::ref_from_prefix(&buffer).map_err(|_| CoreError::BufferTooSmall {
                 expected: EXT4_SUPERBLOCK_SIZE,
                 found: buffer.len(),
             })?;
@@ -105,13 +103,17 @@ impl BlockDevice {
     }
 
     /// Reads an ext4 superblock located at a specific block number.
-    pub fn read_superblock_at_block(&self, block_nr: u64, block_size: u64) -> Result<Ext4Superblock, IoError> {
+    pub fn read_superblock_at_block(
+        &self,
+        block_nr: u64,
+        block_size: u64,
+    ) -> Result<Ext4Superblock, IoError> {
         let mut buffer = [0u8; EXT4_SUPERBLOCK_SIZE];
         let offset = block_nr * block_size;
         self.file.read_exact_at(&mut buffer, offset)?;
 
-        let (sb, _) = Ext4Superblock::ref_from_prefix(&buffer)
-            .map_err(|_| CoreError::BufferTooSmall {
+        let (sb, _) =
+            Ext4Superblock::ref_from_prefix(&buffer).map_err(|_| CoreError::BufferTooSmall {
                 expected: EXT4_SUPERBLOCK_SIZE,
                 found: buffer.len(),
             })?;
@@ -160,7 +162,10 @@ impl BlockDevice {
     }
 
     /// Reads all Block Group Descriptors from disk into memory.
-    pub fn read_group_descriptors(&self, sb: &Ext4Superblock) -> Result<Vec<Ext4GroupDesc>, IoError> {
+    pub fn read_group_descriptors(
+        &self,
+        sb: &Ext4Superblock,
+    ) -> Result<Vec<Ext4GroupDesc>, IoError> {
         let block_size = sb.block_size();
         let desc_size = sb.desc_size();
         let bg_count = sb.block_groups_count() as usize;
@@ -254,10 +259,7 @@ impl BlockDevice {
     }
 
     /// Parses inodes from raw inode table bytes.
-    pub fn parse_inodes_from_table(
-        table_bytes: &[u8],
-        inode_size: usize,
-    ) -> Vec<Ext4Inode> {
+    pub fn parse_inodes_from_table(table_bytes: &[u8], inode_size: usize) -> Vec<Ext4Inode> {
         let count = table_bytes.len() / inode_size;
         let mut inodes = Vec::with_capacity(count);
 
@@ -292,6 +294,12 @@ impl BlockDevice {
         }
         let offset = block_nr * block_size;
         self.file.write_all_at(data, offset)?;
+        Ok(())
+    }
+
+    /// Forces preceding writes to stable storage before rollback advances.
+    pub fn sync_all(&self) -> Result<(), IoError> {
+        self.file.sync_all()?;
         Ok(())
     }
 
@@ -333,6 +341,14 @@ impl BlockDevice {
     /// True if Linux `io_uring` kernel submission queue is active.
     pub fn is_io_uring_active(&self) -> bool {
         self.uring.is_some()
+    }
+
+    /// True when the active ring has a persistent registered-buffer pool.
+    pub fn has_registered_io_buffers(&self) -> bool {
+        self.uring
+            .as_ref()
+            .map(IoUringEngine::fixed_buffers_registered)
+            .unwrap_or(false)
     }
 
     /// Reads multiple blocks in parallel using Linux `io_uring` if active,

@@ -11,3 +11,4 @@ nexfsck-io = { path = "../nexfsck-io" }
 zerocopy.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+crc32fast.workspace = true

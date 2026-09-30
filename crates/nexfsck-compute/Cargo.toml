@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 nexfsck-core = { path = "../nexfsck-core" }
 zerocopy.workspace = true
-crc32fast.workspace = true
 rayon.workspace = true
 roaring.workspace = true
 thiserror.workspace = true

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generates high-resolution side-by-side live benchmark GIF and MP4 video
-comparing legacy e2fsck against nexfsck on real ext4 filesystem data.
+creating illustrative, non-evidentiary e2fsck/nexfsck benchmark media.
 """
 
 import os
@@ -71,18 +71,18 @@ def draw_bottom_dashboard(draw, fonts, frame_idx, total_frames):
     draw.rounded_rectangle([dx, dy, dx + dw, dy + dh], radius=10, fill=(18, 21, 29), outline=(38, 45, 61), width=1)
     
     # Header of dashboard
-    draw.text((dx + 20, dy + 12), "REAL BENCHMARK TELEMETRY & SYSTEM COHERENCY", font=fonts["title"], fill=(148, 163, 184))
+    draw.text((dx + 20, dy + 12), "ILLUSTRATIVE TELEMETRY — NOT A BENCHMARK RESULT", font=fonts["title"], fill=(148, 163, 184))
     
     parity_color = (34, 197, 94) if frame_idx >= 35 else (148, 163, 184)
-    parity_text = "● 100% BIT-EXACT GROUND TRUTH MATCH (VERIFIED)" if frame_idx >= 35 else "● RUNNING INTEGRITY COMPARISON..."
+    parity_text = "● AGGREGATE COUNTERS MATCH (ILLUSTRATIVE)" if frame_idx >= 35 else "● COMPARING SELECTED COUNTERS..."
     draw.text((dx + 920, dy + 12), parity_text, font=fonts["badge"], fill=parity_color)
     
     draw.line([dx + 15, dy + 34, dx + dw - 15, dy + 34], fill=(30, 41, 59), width=1)
     
     cards = [
         ("I/O SUBSYSTEM", "io_uring 128 SQE", "Kernel async vs sync read()", (56, 189, 248)),
-        ("PARALLELISM", "16 Threads + GPU", "Rayon work-stealing vs 1 core", (168, 85, 247)),
-        ("EXECUTION TIME", "0.02s (14x Faster)", "e2fsck: 0.28s | nexfsck: 0.02s", (34, 197, 94)),
+        ("PARALLELISM", "Rayon worker pool", "Thread count is run-specific", (168, 85, 247)),
+        ("EXECUTION TIME", "UNVERIFIED SAMPLE", "Not a published benchmark", (34, 197, 94)),
         ("INODE & BLOCK PARITY", "15,186 Inodes / 54,844 Blks", "0 errors • 0 leaks • 0 orphans", (251, 191, 36)),
     ]
     
@@ -137,11 +137,11 @@ def generate_frames():
     nexfsck_prompt = ("root@linux-dev:~# nexfsck -n /dev/nvme0n1p1", (255, 255, 255), True)
     nexfsck_banner = [
         ("==================================================", (59, 130, 246), False),
-        ("  nexfsck v0.1.0 — Hardware-Accelerated fsck", (96, 165, 250), True),
+        ("  nexfsck v0.1.0 — experimental ext4 checker", (96, 165, 250), True),
         ("==================================================", (59, 130, 246), False),
         ("INFO Hardware: 16 CPU cores (Rayon active), 31.3 GB RAM", (34, 197, 94), False),
         ("INFO SIMD    : AVX2: true, ARM NEON/CRC: false", (34, 197, 94), False),
-        ("INFO GPU     : NVIDIA GeForce RTX 4060 [VRAM: 8.0 GB]", (168, 85, 247), True),
+        ("INFO GPU     : CUDA PTX candidates + CPU verification", (168, 85, 247), True),
         ("INFO I/O     : Linux io_uring (Queue Depth 128) [Active]", (56, 189, 248), True),
         ("INFO ext4    : Magic OK (0xEF53) | 262,144 blocks | 8 groups", (203, 213, 225), False),
         ("INFO Journal : JBD2 Active | Seq: 6 | Clean: true", (203, 213, 225), False),
@@ -159,7 +159,7 @@ def generate_frames():
         ("  Entries: 17,945 Dentries | False-Free: 0 | Leaks: 0", (203, 213, 225), False),
         ("--------------------------------------------------", (51, 65, 85), False),
         ("[OK] Filesystem CLEAN (0 errors) | Elapsed: 0.02s", (34, 197, 94), True),
-        ("[>>] 14x FASTER THAN e2fsck (io_uring + Rayon 16T)", (56, 189, 248), True),
+        ("[>>] ILLUSTRATION — NOT A PUBLISHED SPEED RESULT", (56, 189, 248), True),
     ]
 
     print("Rendering animation frames...")
@@ -170,7 +170,7 @@ def generate_frames():
         
         # Header
         draw.text((40, 22), "LIVE BENCHMARK: ext4 Filesystem Integrity Verification", font=fonts["header"], fill=(248, 250, 252))
-        draw.text((810, 26), "Target: 1.0 GiB ext4 | 16-Core Rayon | NVIDIA RTX 4060 | io_uring", font=fonts["mono"], fill=(148, 163, 184))
+        draw.text((810, 26), "Illustrative UI — see docs/benchmarking.md", font=fonts["mono"], fill=(148, 163, 184))
         draw.line([40, 56, W - 40, 56], fill=(30, 41, 59), width=1)
         
         # Determine states
@@ -180,7 +180,7 @@ def generate_frames():
         draw_window_frame(draw, fonts, 40, 70, 660, 660, "e2fsck v1.46.5", "1 Core • POSIX Direct", (71, 85, 105), is_active=e2_active)
         
         nex_badge_col = (34, 197, 94) if idx >= 18 else (59, 130, 246)
-        nex_badge_txt = "DONE IN 0.02s (14x)" if idx >= 18 else "16T • io_uring • RTX 4060"
+        nex_badge_txt = "UNVERIFIED SAMPLE" if idx >= 18 else "CPU • optional io_uring"
         draw_window_frame(draw, fonts, 740, 70, 660, 660, "nexfsck v0.1.0", nex_badge_txt, nex_badge_col, is_active=nex_active)
         
         # Build Left lines (e2fsck)
