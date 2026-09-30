@@ -92,6 +92,61 @@ impl BlockDevice {
         Ok(*sb)
     }
 
+    /// Reads an ext4 superblock located at a specific block number.
+    pub fn read_superblock_at_block(&self, block_nr: u64, block_size: u64) -> Result<Ext4Superblock, IoError> {
+        let mut buffer = [0u8; EXT4_SUPERBLOCK_SIZE];
+        let offset = block_nr * block_size;
+        self.file.read_exact_at(&mut buffer, offset)?;
+
+        let (sb, _) = Ext4Superblock::ref_from_prefix(&buffer)
+            .map_err(|_| CoreError::BufferTooSmall {
+                expected: EXT4_SUPERBLOCK_SIZE,
+                found: buffer.len(),
+            })?;
+
+        sb.verify_magic()?;
+        Ok(*sb)
+    }
+
+    /// Searches known backup superblock offsets (powers of 3, 5, 7, etc.) if primary is lost.
+    pub fn find_backup_superblocks(&self) -> Vec<(u64, Ext4Superblock)> {
+        let mut candidates = Vec::new();
+        // Common candidate blocks across 1K, 2K, and 4K ext4 formats
+        let candidate_blocks = [32768, 8193, 24577, 40961, 57345, 73729, 98304];
+
+        for &blk in &candidate_blocks {
+            for &block_size in &[4096u64, 1024u64, 2048u64] {
+                if let Ok(sb) = self.read_superblock_at_block(blk, block_size) {
+                    candidates.push((blk, sb));
+                    break;
+                }
+            }
+        }
+
+        candidates
+    }
+
+    /// Reads Multi-Mount Protection block if MMP feature is enabled.
+    pub fn read_mmp(&self, sb: &Ext4Superblock) -> Result<Option<nexfsck_core::Ext4Mmp>, IoError> {
+        if !sb.has_incompat_feature(nexfsck_core::EXT4_FEATURE_INCOMPAT_MMP) {
+            return Ok(None);
+        }
+
+        let mmp_block = u64::from_le(sb.s_mmp_block);
+        if mmp_block == 0 {
+            return Ok(None);
+        }
+
+        let block_bytes = self.read_block(mmp_block, sb.block_size())?;
+        if let Ok((mmp, _)) = nexfsck_core::Ext4Mmp::ref_from_prefix(&block_bytes) {
+            if mmp.is_valid_magic() {
+                return Ok(Some(*mmp));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Reads all Block Group Descriptors from disk into memory.
     pub fn read_group_descriptors(&self, sb: &Ext4Superblock) -> Result<Vec<Ext4GroupDesc>, IoError> {
         let block_size = sb.block_size();

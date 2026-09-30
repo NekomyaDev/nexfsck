@@ -97,6 +97,8 @@ pub struct InodeVerificationStats {
     pub directory_inodes: AtomicU64,
     pub regular_file_inodes: AtomicU64,
     pub symlink_inodes: AtomicU64,
+    pub fast_symlinks_checked: AtomicU64,
+    pub corrupted_symlinks: AtomicU64,
     pub extent_trees_checked: AtomicU64,
     pub duplicate_blocks: AtomicU64,
     pub out_of_bounds_blocks: AtomicU64,
@@ -129,14 +131,17 @@ impl BlockAllocationTracker {
     pub fn mark_range(&self, start_block: u64, count: u32) -> bool {
         let mut bm = self.bitmap.write().unwrap();
         let mut collision = false;
+        let mut newly_added = 0u64;
         for b in start_block..(start_block + count as u64) {
             if b < u32::MAX as u64 {
                 if !bm.insert(b as u32) {
                     collision = true;
+                } else {
+                    newly_added += 1;
                 }
             }
         }
-        self.allocated_count.fetch_add(count as u64, Ordering::Relaxed);
+        self.allocated_count.fetch_add(newly_added, Ordering::Relaxed);
         !collision
     }
 
@@ -180,6 +185,12 @@ pub fn verify_inodes_parallel(
             stats.regular_file_inodes.fetch_add(1, Ordering::Relaxed);
         } else if inode.is_symlink() {
             stats.symlink_inodes.fetch_add(1, Ordering::Relaxed);
+            if inode.is_fast_symlink() {
+                stats.fast_symlinks_checked.fetch_add(1, Ordering::Relaxed);
+                if inode.fast_symlink_target().is_none() {
+                    stats.corrupted_symlinks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
 
         // Validate extent tree if used
@@ -195,6 +206,42 @@ pub fn verify_inodes_parallel(
             );
         }
     });
+}
+
+/// Discrepancy statistics when comparing on-disk inode bitmaps against in-memory inodes.
+#[derive(Debug, Default, Clone)]
+pub struct InodeBitmapDiscrepancy {
+    pub false_free_inodes: u64,
+    pub leaked_inodes: u64,
+}
+
+/// Reconciles on-disk inode allocation bitmap against active inodes.
+pub fn reconcile_inode_bitmap(
+    disk_bitmap: &[u8],
+    inodes: &[Ext4Inode],
+) -> InodeBitmapDiscrepancy {
+    let mut discrepancy = InodeBitmapDiscrepancy::default();
+
+    for (i, inode) in inodes.iter().enumerate() {
+        let byte_idx = i / 8;
+        let bit_idx = i % 8;
+
+        let disk_is_allocated = if byte_idx < disk_bitmap.len() {
+            (disk_bitmap[byte_idx] & (1 << bit_idx)) != 0
+        } else {
+            false
+        };
+
+        let inode_is_used = inode.is_used();
+
+        if inode_is_used && !disk_is_allocated {
+            discrepancy.false_free_inodes += 1;
+        } else if !inode_is_used && disk_is_allocated {
+            discrepancy.leaked_inodes += 1;
+        }
+    }
+
+    discrepancy
 }
 
 /// Multi-level extent tree verification with depth bounding (max depth 5).

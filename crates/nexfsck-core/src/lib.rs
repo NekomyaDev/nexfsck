@@ -46,6 +46,7 @@ pub const EXT4_FEATURE_RO_COMPAT_HUGE_FILE: u32 = 0x0008;
 pub const EXT4_FEATURE_RO_COMPAT_GDT_CSUM: u32 = 0x0010;
 pub const EXT4_FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0020;
 pub const EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
+pub const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER2: u32 = 0x0200;
 pub const EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 
 pub const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
@@ -269,6 +270,34 @@ impl Ext4Superblock {
         let total = self.total_blocks();
         (total + bpg - 1) / bpg
     }
+
+    /// Determines if a specific block group contains a superblock and group descriptor backup.
+    pub fn group_has_superblock(&self, bg: u64) -> bool {
+        if bg == 0 {
+            return true;
+        }
+        if self.has_ro_compat_feature(EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER2) {
+            let b1 = u32::from_le(self.s_backup_bgs[0]) as u64;
+            let b2 = u32::from_le(self.s_backup_bgs[1]) as u64;
+            return (b1 != 0 && bg == b1) || (b2 != 0 && bg == b2);
+        }
+        if self.has_ro_compat_feature(EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER) {
+            if bg == 1 {
+                return true;
+            }
+            for &base in &[3, 5, 7] {
+                let mut val = base;
+                while val <= bg {
+                    if val == bg {
+                        return true;
+                    }
+                    val *= base;
+                }
+            }
+            return false;
+        }
+        true
+    }
 }
 
 /// ext4 Block Group Descriptor on-disk layout (64-byte unified structure).
@@ -441,6 +470,21 @@ impl Ext4Inode {
         (hi << 32) | lo
     }
 
+    pub fn is_fast_symlink(&self) -> bool {
+        self.is_symlink() && self.file_size() <= 60 && !self.uses_extents()
+    }
+
+    pub fn fast_symlink_target(&self) -> Option<String> {
+        if !self.is_fast_symlink() {
+            return None;
+        }
+        let len = self.file_size() as usize;
+        if len > 60 {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&self.i_block[..len]).to_string())
+    }
+
     pub fn extent_header(&self) -> Option<Ext4ExtentHeader> {
         if !self.uses_extents() || self.is_inline_data() {
             return None;
@@ -451,6 +495,32 @@ impl Ext4Inode {
         } else {
             None
         }
+    }
+}
+
+pub const EXT4_MMP_MAGIC: u32 = 0x004D4D50;
+
+/// Multi-Mount Protection on-disk structure.
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C, packed)]
+pub struct Ext4Mmp {
+    pub mmp_magic: u32,
+    pub mmp_seq: u32,
+    pub mmp_time: u64,
+    pub mmp_nodename: [u8; 64],
+    pub mmp_bdevname: [u8; 32],
+    pub mmp_check_interval: u16,
+    pub mmp_pad: u16,
+    pub mmp_checksum: u32,
+}
+
+impl Ext4Mmp {
+    pub fn is_valid_magic(&self) -> bool {
+        u32::from_le(self.mmp_magic) == EXT4_MMP_MAGIC
+    }
+
+    pub fn sequence(&self) -> u32 {
+        u32::from_le(self.mmp_seq)
     }
 }
 
