@@ -31,6 +31,7 @@ rule over UUID, group number and descriptor bytes excluding the checksum field.
 | Feature | Status | Current scope / limitation |
 | --- | --- | --- |
 | extents | Partially supported | Inline roots/external nodes parsed and external-node checksums verified; complete extent-tree semantic parity is not claimed |
+| Backup superblocks | Partially supported | Manually selected backup checksum is verified; automatic discovery does not checksum every candidate or compare all geometry fields, and no replacement is performed |
 | External xattr blocks | Partially supported | External xattr block structure/checksum and bounds verified; semantic hashes and cross-inode refcount accounting remain unchecked |
 | 64bit | Read-only supported | High block-address fields and descriptor sizes are parsed |
 | metadata_csum | Partially supported | Superblock, group descriptor, allocation bitmap, inode, directory/HTree, external extent and external xattr block checksums validated; xattr semantics and MMP remain incomplete |
@@ -50,6 +51,8 @@ rule over UUID, group number and descriptor bytes excluding the checksum field.
 | casefold | Explicitly rejected | Unicode normalization and casefold semantics are not checked |
 | MMP | Explicitly rejected | Checksum and active-owner safety checks are incomplete |
 | external journal | Explicitly rejected | External-device discovery/replay is not implemented |
+| Unknown incompat / RO-compat bits | Explicitly rejected | Unknown incompatibility and unverified RO-compatibility bits fail before scanning |
+| Unknown compat bits | Ignored per ext4 compat semantics | The recognized `orphan_file` compat feature is explicitly rejected because its inode-recovery semantics are not checked |
 
 This matrix is intentionally conservative. Parsed or read-only supported does
 not imply parity with e2fsck recovery behavior.
