@@ -21,12 +21,15 @@ import subprocess
 import sys
 import time
 
-IMG_PATH = "/tmp/stress_10g.img"
+IMG_PATH = os.environ.get("NEXFSCK_BENCH_IMAGE", "/tmp/stress_10g.img")
 MNT_PATH = "/tmp/stress_mnt"
 UNDO_LOG = "/tmp/stress_10g_repair.undo"
 CORRUPT_IMG = "/tmp/stress_10g_corrupt.img"
-NEXFSCK_BIN = "/home/pop-os/nexfsck/target/release/nexfsck"
-RESULT_DIR = "/home/pop-os/nexfsck/benchmark-results"
+REPO_ROOT = "/home/pop-os/nexfsck"
+NEXFSCK_BIN = f"{REPO_ROOT}/target/release/nexfsck"
+RESULT_DIR = os.environ.get(
+    "NEXFSCK_BENCH_RESULTS_DIR", "/home/pop-os/nexfsck/benchmark-results"
+)
 RESULT_JSON = f"{RESULT_DIR}/latest.json"
 COMPARISON_RUNS = 10
 BACKEND_MODES = {
@@ -38,16 +41,25 @@ BACKEND_MODES = {
 }
 
 def source_provenance():
-    repo = "/home/pop-os/nexfsck"
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
+    ).strip()
     status = subprocess.check_output(
-        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo, text=True
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=REPO_ROOT,
+        text=True,
     )
-    diff = subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=repo)
+    diff = subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=REPO_ROOT)
+    digest = hashlib.sha256()
+    with open(NEXFSCK_BIN, "rb") as binary:
+        for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+            digest.update(chunk)
     return {
         "benchmarked_source_commit": commit,
         "benchmarked_worktree_clean": not bool(status.strip()),
         "benchmarked_worktree_diff_sha256": hashlib.sha256(diff).hexdigest() if diff else None,
+        "benchmarked_binary_sha256": digest.hexdigest(),
+        "binary_build_command": "cargo build --release -p nexfsck",
         # A commit cannot contain its own hash. Consumers resolve the publication
         # commit from Git history using the documented command instead.
         "artifact_publication_commit": None,
@@ -67,15 +79,20 @@ def timed_run(command):
 
 def populate_filesystem():
     print("=" * 70)
-    print("STAGE 1: GENERATING 10.0 GiB REAL DENSE EXT4 FILESYSTEM (80 GROUPS)")
+    print("STAGE 1: GENERATING SPARSE-LOGICAL 10.0 GiB EXT4 IMAGE (80 GROUPS)")
     print("=" * 70)
-    
-    if os.path.exists(MNT_PATH):
-        subprocess.run(["sudo", "umount", MNT_PATH], stderr=subprocess.DEVNULL)
-    os.makedirs(MNT_PATH, exist_ok=True)
 
     if os.path.exists(IMG_PATH):
-        os.remove(IMG_PATH)
+        raise FileExistsError(f"refusing to overwrite existing benchmark image: {IMG_PATH}")
+    for path in (CORRUPT_IMG, UNDO_LOG):
+        if os.path.exists(path):
+            raise FileExistsError(f"refusing to overwrite existing benchmark artifact: {path}")
+    mounted = subprocess.run(
+        ["findmnt", "-rn", "--mountpoint", MNT_PATH], capture_output=True, text=True
+    )
+    if mounted.returncode == 0:
+        raise RuntimeError(f"refusing to unmount existing filesystem at {MNT_PATH}")
+    os.makedirs(MNT_PATH, exist_ok=True)
 
     print(f"Creating 10.0 GiB image at {IMG_PATH}...")
     # Sparse creation keeps the 10 GiB logical geometry while allowing a clean
@@ -339,8 +356,6 @@ def run_fuzzing_and_repair_test():
     # Bitmap repair tests use a separate legacy-checksum image because nexfsck
     # intentionally refuses to recalculate metadata_csum after an untrusted
     # bitmap payload mismatch.
-    if os.path.exists(CORRUPT_IMG):
-        os.remove(CORRUPT_IMG)
     subprocess.check_call(["truncate", "-s", "10G", CORRUPT_IMG])
     subprocess.check_call(["mkfs.ext4", "-q", "-F", "-b", "4096", "-O", "64bit,dir_index,extents,^metadata_csum", CORRUPT_IMG])
     block_groups_info = subprocess.check_output(["dumpe2fs", CORRUPT_IMG], stderr=subprocess.DEVNULL).decode()
@@ -447,6 +462,7 @@ def run_fuzzing_and_repair_test():
     }
 
 def main():
+    subprocess.check_call(["cargo", "build", "--release", "-p", "nexfsck"], cwd=REPO_ROOT)
     provenance = source_provenance()
     print("=" * 70)
     print("  NEXFSCK 10.0 GiB ENTERPRISE STRESS & ENDURANCE VERIFICATION")
@@ -477,7 +493,10 @@ def main():
                 "machine": platform.machine(),
                 "cpu": next((line.split(":", 1)[1].strip() for line in subprocess.check_output(["lscpu"], text=True).splitlines() if line.startswith("Model name:")), platform.processor()),
                 "memory_gib": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3), 2),
-                "fixture_storage": "/tmp tmpfs (memory-backed live-USB environment)",
+                "fixture_storage": os.environ.get(
+                    "NEXFSCK_FIXTURE_STORAGE",
+                    "/tmp tmpfs (memory-backed live-USB environment)",
+                ),
                 "e2fsck_version": subprocess.run(["e2fsck", "-V"], capture_output=True, text=True).stderr.strip(),
                 "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
             },
