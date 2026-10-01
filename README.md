@@ -45,7 +45,7 @@ Click the preview to open the [MP4 video](assets/benchmark_live.mp4). Full measu
 
 ### Integrity coverage
 
-The metadata checksum coverage and ext4 feature compatibility matrix are in [`docs/ext4-integrity-coverage.md`](docs/ext4-integrity-coverage.md). Implemented checksum validation covers superblocks, group descriptors, allocation bitmaps, inodes, directories/HTrees, external extent-tree blocks, and external xattr blocks. Xattr semantic hashes/refcount accounting, MMP, and full JBD2 metadata checksums remain partial or rejected; unsupported feature combinations fail closed. Allocation, bitmap, directory, thread-scaling, and additional-workload results are documented in [`docs/hot-path-optimization.md`](docs/hot-path-optimization.md).
+The metadata checksum coverage and ext4 feature compatibility matrix are in [`docs/ext4-integrity-coverage.md`](docs/ext4-integrity-coverage.md). Implemented checksum validation covers superblocks, group descriptors, allocation bitmaps, inodes, directories/HTrees, external extent-tree blocks, and external xattr blocks. Xattr semantic hashes/refcount accounting, MMP, and full JBD2 metadata checksums remain partial or rejected; unsupported feature combinations fail closed. Earlier inode/extent workload measurements in [`docs/hot-path-optimization.md`](docs/hot-path-optimization.md) predate the current integrity changes and are marked historical; updated per-workload fixtures remain outstanding.
 
 ## Workspace architecture
 

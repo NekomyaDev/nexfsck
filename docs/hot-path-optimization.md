@@ -117,7 +117,11 @@ roughly 60%. These results remain tmpfs/warm-cache specific.
 
 ## Additional workloads
 
-The reproducible `workload_profiles.py` runner measured:
+These are historical results from benchmark source
+`dbc61335a6331e433e4de76ed473c0d62e96692e`, before later inode/external extent
+checksum and xattr-integrity changes. They have not been rerun against the
+current integrity-enabled source and are not current results. The historical
+`workload_profiles.py` runner measured:
 
 | Fixture | e2fsck | nexfsck | Normalized Nexfsck rate |
 | --- | ---: | ---: | ---: |
@@ -127,9 +131,12 @@ The reproducible `workload_profiles.py` runner measured:
 Raw samples and directory/group normalizations are in
 `benchmark-results/workload-profiles.json`.
 
-## Physical storage limitation
+## Physical storage
 
-The host exposes mounted/user-data HDD and NVMe partitions plus the live USB,
-but no disposable physical device. No raw-device repair or destructive test was
-performed. Therefore this work makes no physical-storage or io_uring crossover
-claim.
+The current integrity build has also been measured on a sparse regular image
+stored on a mounted ext4 HDD; the image was loop-mounted only for population and
+was removed after the run. This is not a raw-device test and used no cold-cache
+protocol. The exact result is in
+`benchmark-results/physical_hdd_7066f93/latest.json`. No raw-device repair or
+destructive test was performed, and no general physical-storage or io_uring
+crossover claim is made.

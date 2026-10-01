@@ -45,3 +45,34 @@ Run both a locality-friendly and a sparse case and retain stdout plus `/usr/bin/
 ```
 
 The example reports actual RSS delta and chunk count. It measures address-map behavior on the executing machine; it does not establish exabyte-scale operational support.
+
+## Measured 10 GiB comparisons (2026-10-01)
+
+These are two storage-specific measurements of one fixture, not a scaling study.
+Both use a sparse 10 GiB ext4 image, 4 KiB blocks, 80 block groups, 100,000
+generated files, 2,000 requested symlinks, and 1,000 requested hardlinks.
+The image was populated and checked through a loop mount. Checker comparisons
+used ten interleaved runs with no global cache drop; all reported times are
+external process wall time. First-run outliers remain in the samples and p95.
+
+Both full raw JSON files retain every sample, backend timings, phase profile,
+environment, 30-pass endurance data, and repair/rollback assertions:
+[`tmpfs result`](../benchmark-results/latest.json) and
+[`HDD regular-image result`](../benchmark-results/physical_hdd_7066f93/latest.json).
+They are authoritative for the exact medians, p95, standard deviations, and
+backend matrix for these runs.
+The release executable was rebuilt by the runner immediately before the runs;
+both records name source revision `7066f9367b646b6b461b58e01067eb006c3ebc14`
+and contain the same binary SHA-256.
+Resolve the later artifact-publication commit with the command stored in each
+JSON artifact; a commit cannot contain its own hash.
+
+The fixture reports 112,308 e2fsck “inodes used” versus 112,301 Nexfsck active
+inodes (delta -7); those counters have not been shown to have identical
+semantics, so this is not inode parity. Allocated block totals match, but that
+is only aggregate parity—not allocated-set, diagnostic, or repair parity. The
+main fixture has no external xattrs, and these measurements do not validate the
+unimplemented inode-heavy, extent-heavy, directory-heavy, or xattr-heavy
+workload profiles. The HDD result is a regular-file loop image, not a raw-device
+test; no cold-cache comparison was performed. These timings do not establish
+e2fsck-equivalent integrity coverage or production-scale performance.
