@@ -58,12 +58,11 @@ external process wall time. First-run outliers remain in the samples and p95.
 Both full raw JSON files retain every sample, backend timings, phase profile,
 environment, 30-pass endurance data, and repair/rollback assertions:
 [`tmpfs result`](../benchmark-results/latest.json) and
-[`HDD regular-image result`](../benchmark-results/physical_hdd_7066f93/latest.json).
+[`HDD regular-image result`](../benchmark-results/physical_hdd/latest.json).
 They are authoritative for the exact medians, p95, standard deviations, and
 backend matrix for these runs.
 The release executable was rebuilt by the runner immediately before the runs;
-both records name source revision `7066f9367b646b6b461b58e01067eb006c3ebc14`
-and contain the same binary SHA-256.
+each record names the exact source revision and binary SHA-256.
 Resolve the later artifact-publication commit with the command stored in each
 JSON artifact; a commit cannot contain its own hash.
 

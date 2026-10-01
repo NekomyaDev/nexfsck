@@ -137,6 +137,6 @@ The current integrity build has also been measured on a sparse regular image
 stored on a mounted ext4 HDD; the image was loop-mounted only for population and
 was removed after the run. This is not a raw-device test and used no cold-cache
 protocol. The exact result is in
-`benchmark-results/physical_hdd_7066f93/latest.json`. No raw-device repair or
+`benchmark-results/physical_hdd/latest.json`. No raw-device repair or
 destructive test was performed, and no general physical-storage or io_uring
 crossover claim is made.
