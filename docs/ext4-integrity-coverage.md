@@ -18,7 +18,7 @@ the underlying metadata.
 | Inode | Validated | Validated | Raw inode size, inode number, generation and checksum fields follow e2fsprogs behavior |
 | Directory leaf block | Dirents parsed, no checksum | Validated | CRC32c uses filesystem seed, inode number, generation and bytes before the fake tail |
 | HTree root/node | Structure partially validated | Checksum validated; structural validation partial | CRC32c uses inode context, occupied entry range and dx tail; real indexed-image corruption test |
-| External extent-tree block | Extents parsed, no checksum | Parsed but not checksummed | Initial verifier math disagreed with a clean e2fsprogs-created extent block; enforcement was withheld until the oracle discrepancy is resolved |
+| External extent-tree block | Extents parsed, no checksum | Validated | CRC32c uses inode number/generation seed and the `eh_max`-defined extent tail; clean and corrupted real-image oracle test |
 | Extended-attribute block | Not parsed | Unsupported coverage | No checksum validation |
 | MMP block | Magic/state parsed | Partially validated | MMP checksum and sequence freshness validation are not implemented |
 | JBD2 | Header/transactions parsed | Partially validated | Journal checksum-v3 data tags are checked; full journal metadata checksum coverage is not claimed |
@@ -30,9 +30,9 @@ rule over UUID, group number and descriptor bytes excluding the checksum field.
 
 | Feature | Status | Current scope / limitation |
 | --- | --- | --- |
-| extents | Partially supported | Inline root and external nodes parsed; external-node checksum validation pending |
+| extents | Partially supported | Inline roots/external nodes parsed and external-node checksums verified; complete extent-tree semantic parity is not claimed |
 | 64bit | Read-only supported | High block-address fields and descriptor sizes are parsed |
-| metadata_csum | Partially supported | Superblock, group descriptor, allocation bitmap, inode and directory/HTree checksums validated; external extent, MMP and xattr remain incomplete |
+| metadata_csum | Partially supported | Superblock, group descriptor, allocation bitmap, inode, directory/HTree and external extent checksums validated; MMP and xattr remain incomplete |
 | metadata_csum_seed | Read-only supported | Explicit checksum seed used for implemented checksum classes |
 | gdt_csum | Partially supported | Legacy group descriptor CRC16 validated |
 | sparse_super2 | Read-only supported | Backup-superblock placement follows the two explicit backup group numbers |

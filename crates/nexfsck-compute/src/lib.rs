@@ -195,6 +195,31 @@ impl Ext4MetadataChecksum {
         provided == crc
     }
 
+    /// Validates a non-inline extent-tree node using the inode checksum seed
+    /// and the on-disk eh_max-defined tail position.
+    pub fn verify_extent_tree_block(&self, inode: u32, generation: u32, block: &[u8]) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        if !self.crc32c_supported || block.len() < 16 {
+            return false;
+        }
+        let magic = u16::from_le_bytes(block[0..2].try_into().unwrap());
+        if magic != nexfsck_core::EXT4_EXTENT_MAGIC {
+            return false;
+        }
+        let max_entries = u16::from_le_bytes(block[4..6].try_into().unwrap()) as usize;
+        let tail = 12usize.saturating_add(max_entries.saturating_mul(12));
+        if tail.checked_add(4).is_none_or(|end| end > block.len()) {
+            return false;
+        }
+        let provided = u32::from_le_bytes(block[tail..tail + 4].try_into().unwrap());
+        let mut crc = ext4_crc32c(self.seed, &inode.to_le_bytes());
+        crc = ext4_crc32c(crc, &generation.to_le_bytes());
+        crc = ext4_crc32c(crc, &block[..tail]);
+        provided == crc
+    }
+
     pub fn verify_bitmap(&self, _group: u32, bitmap: &[u8], provided: u32, has_high: bool) -> bool {
         if !self.enabled {
             return true;
@@ -687,6 +712,13 @@ pub struct InodeVerificationStats {
     pub extent_block_checksum_failures: AtomicU64,
 }
 
+#[derive(Clone, Copy)]
+pub struct ExtentTreeChecksumContext {
+    pub inode_number: u32,
+    pub inode_generation: u32,
+    pub metadata_checksum: Ext4MetadataChecksum,
+}
+
 impl InodeVerificationStats {
     pub fn new() -> Self {
         Self::default()
@@ -821,8 +853,10 @@ impl BlockAllocationTracker {
 /// Validates a batch of inodes in parallel using Rayon work-stealing.
 pub fn verify_inodes_parallel<F>(
     inodes: &[Ext4Inode],
+    first_inode_number: u32,
     tracker: &BlockAllocationTracker,
     stats: &InodeVerificationStats,
+    metadata_checksum: Ext4MetadataChecksum,
     read_block_fn: &F,
 ) where
     F: Fn(u64) -> Option<Vec<u8>> + Sync,
@@ -831,7 +865,7 @@ pub fn verify_inodes_parallel<F>(
         .total_inodes_scanned
         .fetch_add(inodes.len() as u64, Ordering::Relaxed);
 
-    let verify = |inode: &Ext4Inode| {
+    let verify = |(index, inode): (usize, &Ext4Inode)| {
         if !inode.is_used() {
             return;
         }
@@ -855,8 +889,15 @@ pub fn verify_inodes_parallel<F>(
         // Validate extent tree or legacy block pointers
         if inode.uses_extents() && !inode.is_inline_data() {
             stats.extent_trees_checked.fetch_add(1, Ordering::Relaxed);
+            let inode_number = first_inode_number + index as u32;
+            let inode_generation = u32::from_le(inode.i_generation);
             verify_extent_block(
                 &inode.i_block,
+                ExtentTreeChecksumContext {
+                    inode_number,
+                    inode_generation,
+                    metadata_checksum,
+                },
                 tracker.total_blocks(),
                 tracker,
                 stats,
@@ -879,9 +920,9 @@ pub fn verify_inodes_parallel<F>(
     // are faster serially because extent accounting writes through one shared
     // tracker. Rayon remains useful for unusually large batches.
     if inodes.len() <= 16_384 {
-        inodes.iter().for_each(verify);
+        inodes.iter().enumerate().for_each(verify);
     } else {
-        inodes.par_iter().for_each(verify);
+        inodes.par_iter().enumerate().for_each(verify);
     }
 }
 
@@ -932,6 +973,7 @@ pub fn reconcile_inode_bitmap(
 /// Multi-level extent tree verification with depth bounding (max depth 5).
 pub fn verify_extent_block<F>(
     data: &[u8],
+    checksum_context: ExtentTreeChecksumContext,
     max_blocks: u64,
     tracker: &BlockAllocationTracker,
     stats: &InodeVerificationStats,
@@ -942,6 +984,19 @@ pub fn verify_extent_block<F>(
 {
     if current_depth > 5 {
         stats.extent_corruptions.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    if current_depth > 0
+        && !checksum_context.metadata_checksum.verify_extent_tree_block(
+            checksum_context.inode_number,
+            checksum_context.inode_generation,
+            data,
+        )
+    {
+        stats
+            .extent_block_checksum_failures
+            .fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -1009,6 +1064,7 @@ pub fn verify_extent_block<F>(
                 if let Some(child_data) = read_block_fn(child_block) {
                     verify_extent_block(
                         &child_data,
+                        checksum_context,
                         max_blocks,
                         tracker,
                         stats,

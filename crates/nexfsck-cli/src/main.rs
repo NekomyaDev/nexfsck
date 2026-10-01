@@ -630,9 +630,14 @@ fn main() -> ExitCode {
                 inode_metadata_collection_time += operation_started.elapsed();
 
                 let operation_started = Instant::now();
-                verify_inodes_parallel(&inodes, &tracker, &inode_stats, &|blk| {
-                    dev.read_block(blk, block_size).ok()
-                });
+                verify_inodes_parallel(
+                    &inodes,
+                    first_inode,
+                    &tracker,
+                    &inode_stats,
+                    metadata_checksum,
+                    &|blk| dev.read_block(blk, block_size).ok(),
+                );
                 inode_validation_tracking_time += operation_started.elapsed();
                 group_bytes = table_bytes.len() as u64;
                 all_scanned_inodes.push((bg_idx, inodes));

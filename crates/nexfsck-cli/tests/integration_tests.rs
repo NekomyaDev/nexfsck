@@ -366,6 +366,102 @@ fn test_unsupported_feature_fails_closed() {
 }
 
 #[test]
+fn test_external_extent_block_checksum_corruption_oracle() {
+    let source = unique_test_path("extent-csum-source");
+    std::fs::create_dir(&source).unwrap();
+    let fragmented = source.join("fragmented");
+    let mut file = std::fs::File::create(&fragmented).unwrap();
+    for logical_block in (0..20u64).step_by(2) {
+        file.seek(SeekFrom::Start(logical_block * 4096)).unwrap();
+        file.write_all(&vec![logical_block as u8 + 1; 4096])
+            .unwrap();
+    }
+    file.set_len(64 * 1024 * 1024).unwrap();
+    file.sync_all().unwrap();
+
+    let image = unique_test_path("extent-csum.img");
+    assert!(Command::new("truncate")
+        .args(["-s", "128M", image.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-O",
+            "metadata_csum",
+            "-d",
+            source.to_str().unwrap(),
+            image.to_str().unwrap()
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let stat = Command::new("debugfs")
+        .args(["-R", "stat /fragmented", image.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stat_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stat.stdout),
+        String::from_utf8_lossy(&stat.stderr)
+    );
+    let external_block = stat_text
+        .split("(ETB0):")
+        .nth(1)
+        .and_then(|tail| tail.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|number| number.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("fixture did not create an external extent node: {stat_text}"));
+    let (block_size, _, _, _, _) = ext4_layout(&image);
+    let mut raw_node_header = [0u8; 6];
+    let mut image_file = std::fs::File::open(&image).unwrap();
+    image_file
+        .seek(SeekFrom::Start(external_block * block_size + 4))
+        .unwrap();
+    image_file.read_exact(&mut raw_node_header[0..2]).unwrap();
+    let max_entries = u16::from_le_bytes(raw_node_header[0..2].try_into().unwrap()) as u64;
+    let checksum_offset = external_block * block_size + 12 + max_entries * 12;
+
+    let (clean_code, clean_json) = run_nexfsck_json(&image);
+    assert_eq!(clean_code, 0, "{clean_json}");
+    assert!(clean_json.contains("\"extent_block_checksum_failures\": 0"));
+    let clean_e2fsck = Command::new("e2fsck")
+        .args(["-f", "-n", image.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(clean_e2fsck.success());
+
+    let corrupt = unique_test_path("extent-csum-corrupt.img");
+    std::fs::copy(&image, &corrupt).unwrap();
+    flip_image_byte(&corrupt, checksum_offset);
+    let (corrupt_code, corrupt_json) = run_nexfsck_json(&corrupt);
+    assert_eq!(corrupt_code, 4, "{corrupt_json}");
+    assert!(
+        corrupt_json.contains("\"extent_block_checksum_failures\": 1"),
+        "{corrupt_json}"
+    );
+    let corrupt_e2fsck = Command::new("e2fsck")
+        .args(["-f", "-n", corrupt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&corrupt_e2fsck.stdout),
+        String::from_utf8_lossy(&corrupt_e2fsck.stderr)
+    );
+    assert!(
+        corrupt_e2fsck.status.code() == Some(4)
+            || diagnostic.to_lowercase().contains("extent block")
+                && diagnostic.to_lowercase().contains("checksum"),
+        "e2fsck did not identify external extent checksum corruption: {diagnostic}"
+    );
+    std::fs::remove_file(corrupt).unwrap();
+    std::fs::remove_file(image).unwrap();
+    std::fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
 fn test_real_ext4_inode_checksum_clean_layouts_and_seed_modes() {
     for (label, inode_size, features) in [
         ("inode-csum-128", "128", "metadata_csum"),
