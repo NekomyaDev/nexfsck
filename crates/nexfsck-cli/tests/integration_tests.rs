@@ -396,6 +396,42 @@ fn test_unsupported_feature_fails_closed() {
 }
 
 #[test]
+fn test_mmp_filesystem_is_rejected_before_verification() {
+    let image = unique_test_path("mmp-unsupported.img");
+    assert!(Command::new("truncate")
+        .args(["-s", "64M", image.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-O",
+            "metadata_csum,mmp",
+            image.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let output = Command::new(env!("CARGO_BIN_EXE_nexfsck"))
+        .args(["--json", "-n", image.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(4), "{diagnostic}");
+    assert!(
+        diagnostic.contains("MMP checksum validation is incomplete"),
+        "{diagnostic}"
+    );
+    std::fs::remove_file(image).unwrap();
+}
+
+#[test]
 fn test_unknown_incompat_and_ro_compat_bits_fail_closed() {
     for (label, offset, bit, expected) in [
         (
