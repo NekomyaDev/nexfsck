@@ -3,25 +3,25 @@
   Copyright (C) 2026 NekomyaDev | Licensed under Apache-2.0
 ===============================================================
 
-2026-10-01T17:49:20.081525Z  INFO Hardware Detected: 16 CPU cores (Rayon work-stealing active), 31.3 GB RAM
-2026-10-01T17:49:20.081532Z  INFO CPU capabilities (detection only; no dedicated SIMD kernels): AVX-512: false, AVX2: true, ARM CRC: false
-2026-10-01T17:49:20.081534Z  INFO GPU device: deferred until collision workload is known [reported memory: 0.0 GB, CUDA compute active: false]
-2026-10-01T17:49:20.081544Z  INFO Opening target storage: /tmp/stress_10g.img (read_only = true)
-2026-10-01T17:49:20.081546Z  INFO I/O Engine        : Linux io_uring (Queue Depth 128) [Active: false]
-2026-10-01T17:49:20.081547Z  INFO Registered buffers: false
-2026-10-01T17:49:20.081551Z  INFO Filesystem Magic OK (0xEF53) | Block Size: 4096B | Inode Size: 256B | 64-bit: true
-2026-10-01T17:49:20.081553Z  INFO Total Blocks: 2621440 | Free Blocks: 1439203 | Total Inodes: 655360
-2026-10-01T17:49:20.081554Z  INFO Total Block Groups: 80
-2026-10-01T17:49:20.083981Z  INFO JBD2 Journal Active | Seq: 9 | Block Size: 4096B | Clean: true
-2026-10-01T17:49:20.084032Z  INFO Pass 1: Checking Inode Tables and Extent Trees in parallel...
-2026-10-01T17:49:20.117495Z  INFO Extent collision compute: CPU fallback | intervals=110199 | candidates=0
-2026-10-01T17:49:20.117506Z  INFO Pass 2: Checking directory entries and indexed H-Trees (2413 block(s))...
-2026-10-01T17:49:20.128990Z  INFO Pass 2: Validated 116450 directory entries (corrupted entries: 0).
-2026-10-01T17:49:20.128995Z  INFO Pass 3: Checking Directory Connectivity and Orphan Subtrees...
-2026-10-01T17:49:20.129802Z  INFO Pass 3: Directory connectivity verified (orphan directories: 0).
-2026-10-01T17:49:20.129806Z  INFO Pass 4: Checking Inode Reference Counts (Hard links)...
-2026-10-01T17:49:20.130562Z  INFO Pass 4: Inode reference counts validated (mismatches: 0).
-2026-10-01T17:49:20.130565Z  INFO Pass 5: Reconciling on-disk bitmaps against reconstructed allocation state...
+2026-10-01T20:02:03.445036Z  INFO Hardware Detected: 16 CPU cores (Rayon work-stealing active), 31.3 GB RAM
+2026-10-01T20:02:03.445044Z  INFO CPU capabilities (detection only; no dedicated SIMD kernels): AVX-512: false, AVX2: true, ARM CRC: false
+2026-10-01T20:02:03.445047Z  INFO GPU device: deferred until collision workload is known [reported memory: 0.0 GB, CUDA compute active: false]
+2026-10-01T20:02:03.445055Z  INFO Opening target storage: /tmp/stress_10g.img (read_only = true)
+2026-10-01T20:02:03.445058Z  INFO I/O Engine        : Linux io_uring (Queue Depth 128) [Active: false]
+2026-10-01T20:02:03.445059Z  INFO Registered buffers: false
+2026-10-01T20:02:03.445063Z  INFO Filesystem Magic OK (0xEF53) | Block Size: 4096B | Inode Size: 256B | 64-bit: true
+2026-10-01T20:02:03.445065Z  INFO Total Blocks: 2621440 | Free Blocks: 1439196 | Total Inodes: 655360
+2026-10-01T20:02:03.445066Z  INFO Total Block Groups: 80
+2026-10-01T20:02:03.446908Z  INFO JBD2 Journal Active | Seq: 8 | Block Size: 4096B | Clean: true
+2026-10-01T20:02:03.446958Z  INFO Pass 1: Checking Inode Tables and Extent Trees in parallel...
+2026-10-01T20:02:03.481581Z  INFO Extent collision compute: CPU fallback | intervals=110191 | candidates=0
+2026-10-01T20:02:03.481592Z  INFO Pass 2: Checking directory entries and indexed H-Trees (2413 block(s))...
+2026-10-01T20:02:03.494073Z  INFO Pass 2: Validated 116450 directory entries (corrupted entries: 0).
+2026-10-01T20:02:03.494083Z  INFO Pass 3: Checking Directory Connectivity and Orphan Subtrees...
+2026-10-01T20:02:03.495030Z  INFO Pass 3: Directory connectivity verified (orphan directories: 0).
+2026-10-01T20:02:03.495034Z  INFO Pass 4: Checking Inode Reference Counts (Hard links)...
+2026-10-01T20:02:03.495950Z  INFO Pass 4: Inode reference counts validated (mismatches: 0).
+2026-10-01T20:02:03.495954Z  INFO Pass 5: Reconciling on-disk bitmaps against reconstructed allocation state...
 
 --------------------------------------------------
 nexfsck Verification Summary
@@ -30,8 +30,8 @@ Total Block Groups : 80
 Groups Checked     : 80
 Errors Detected    : 0
 Elapsed Time       : 0.05s
-Throughput         : 676.41 MiB/s
-I/O Operations     : 16 (338 IOPS)
+Throughput         : 639.99 MiB/s
+I/O Operations     : 16 (320 IOPS)
 Block Group Map    :
 ################################################################
 ################
@@ -45,7 +45,7 @@ Active Inodes      : 112301
   - Regular Files  : 107945
   - Symlinks       : 2780 (Fast Symlinks: 2685)
 Extent Trees Valid : 109615
-Allocated Blocks   : 1182237 (Tracked in dense bitset)
+Allocated Blocks   : 1182244 (Tracked in dense bitset)
 Directory Entries  : 116450
 Corrupt Directories: 0
 Orphan Directories : 0
@@ -61,4 +61,4 @@ False-Free Inodes  : 0
 Leaked Inodes      : 0
 Journal Dirty      : false
 --------------------------------------------------
-2026-10-01T17:49:20.131346Z  INFO Filesystem consistency check completed cleanly with ZERO errors.
+2026-10-01T20:02:03.496967Z  INFO Filesystem consistency check completed cleanly with ZERO errors.

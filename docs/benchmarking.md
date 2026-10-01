@@ -61,6 +61,11 @@ environment, 30-pass endurance data, and repair/rollback assertions:
 [`HDD regular-image result`](../benchmark-results/physical_hdd/latest.json).
 They are authoritative for the exact medians, p95, standard deviations, and
 backend matrix for these runs.
+
+| Fixture storage | e2fsck median / p95 / stddev | nexfsck median / p95 / stddev | Median ratio | Allocated blocks |
+| --- | --- | --- | ---: | ---: |
+| `/tmp` tmpfs | 128.36 / 150.32 / 7.33 ms | 54.66 / 61.06 / 2.24 ms | 2.35x | 1,182,244 each |
+| Regular sparse image on Seagate HDD (`/dev/sda2`, ext4) | 127.87 / 177.76 / 15.35 ms | 52.02 / 54.14 / 0.99 ms | 2.46x | 1,182,246 each |
 The release executable was rebuilt by the runner immediately before the runs;
 each record names the exact source revision and binary SHA-256.
 Resolve the later artifact-publication commit with the command stored in each
