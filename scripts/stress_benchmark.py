@@ -45,11 +45,30 @@ def source_provenance():
         ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
     ).strip()
     status = subprocess.check_output(
-        ["git", "status", "--porcelain", "--untracked-files=no"],
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--",
+            ".",
+            ":(exclude)benchmark-results/**",
+        ],
         cwd=REPO_ROOT,
         text=True,
     )
-    diff = subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=REPO_ROOT)
+    diff = subprocess.check_output(
+        [
+            "git",
+            "diff",
+            "--binary",
+            "HEAD",
+            "--",
+            ".",
+            ":(exclude)benchmark-results/**",
+        ],
+        cwd=REPO_ROOT,
+    )
     digest = hashlib.sha256()
     with open(NEXFSCK_BIN, "rb") as binary:
         for chunk in iter(lambda: binary.read(1024 * 1024), b""):
