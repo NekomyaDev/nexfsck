@@ -187,7 +187,7 @@ def populate_filesystem():
 
 def run_ground_truth_test():
     print("\n" + "=" * 70)
-    print("STAGE 2: 10.0 GiB GROUND-TRUTH CONSISTENCY & ACCURACY VERIFICATION")
+    print("STAGE 2: 10.0 GiB COMPARATIVE COUNTER AND CLEAN-EXIT CHECK")
     print("=" * 70)
     
     print(f"Running {COMPARISON_RUNS} interleaved warm-cache repetitions per checker...")
@@ -256,8 +256,12 @@ def run_ground_truth_test():
     print("-" * 70)
     print(f"MEDIAN COMPARISON: e2fsck={e2_median:.3f}s vs nexfsck={nex_median:.3f}s -> {speedup:.2f}x")
     print(f"BLOCK PARITY    : e2fsck={e2_blocks} vs nexfsck={nex_blocks} -> MATCH: {e2_blocks == nex_blocks}")
-    print(f"INODE PARITY    : e2fsck={e2_inodes} vs nexfsck active={nex_inodes} -> MATCH: {abs(e2_inodes - nex_inodes) < 25}")
-    print(f"CLEAN CHECK     : nexfsck Errors={nex_errors} (selected counters only; not bit-exact parity)")
+    print(
+        "INODE COUNTS    : "
+        f"e2fsck used={e2_inodes} vs nexfsck active={nex_inodes}; "
+        f"delta={nex_inodes - e2_inodes} (not parity: counter semantics differ)"
+    )
+    print(f"CLEAN CHECK     : nexfsck Errors={nex_errors} (selected counters only)")
     print("-" * 70)
     
     assert e2_blocks == nex_blocks, f"Block count mismatch: {e2_blocks} != {nex_blocks}"
@@ -275,6 +279,8 @@ def run_ground_truth_test():
         "nexfsck_stddev_seconds": statistics.pstdev(nex_times),
         "median_ratio": speedup,
         "e2fsck_inodes": e2_inodes,
+        "nexfsck_active_inodes": nex_inodes,
+        "active_inode_count_delta": nex_inodes - e2_inodes,
         "e2fsck_blocks": e2_blocks,
         "nexfsck_active_inodes": nex_inodes,
         "nexfsck_allocated_blocks": nex_blocks,
