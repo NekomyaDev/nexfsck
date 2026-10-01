@@ -441,6 +441,23 @@ fn test_external_extent_block_checksum_corruption_oracle() {
         corrupt_json.contains("\"extent_block_checksum_failures\": 1"),
         "{corrupt_json}"
     );
+    let corrupt_bytes = std::fs::read(&corrupt).unwrap();
+    let undo = unique_test_path("extent-csum-undo.log");
+    let repair = Command::new(env!("CARGO_BIN_EXE_nexfsck"))
+        .args([
+            "--repair",
+            "--undo-file",
+            undo.to_str().unwrap(),
+            corrupt.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(repair.status.code(), Some(4));
+    assert_eq!(std::fs::read(&corrupt).unwrap(), corrupt_bytes);
+    assert!(
+        !undo.exists(),
+        "checksum-uncertain metadata was journaled for repair"
+    );
     let corrupt_e2fsck = Command::new("e2fsck")
         .args(["-f", "-n", corrupt.to_str().unwrap()])
         .output()

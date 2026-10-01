@@ -1012,6 +1012,11 @@ fn main() -> ExitCode {
     let extent_block_checksum_failures = inode_stats
         .extent_block_checksum_failures
         .load(Ordering::Relaxed);
+    let checksum_failures = inode_checksum_failures
+        + block_bitmap_checksum_failures
+        + inode_bitmap_checksum_failures
+        + directory_checksum_failures
+        + extent_block_checksum_failures;
 
     stats.errors_found += corruptions
         + duplicates
@@ -1033,7 +1038,9 @@ fn main() -> ExitCode {
     let mut errors_were_corrected = false;
     let has_repairable_errors = total_block_discrepancy.false_free_blocks > 0
         || total_inode_discrepancy.false_free_inodes > 0;
-    if args.repair && has_repairable_errors {
+    if args.repair && has_repairable_errors && checksum_failures != 0 {
+        error!("Checksum failures leave metadata integrity unknown; refusing all bitmap repair");
+    } else if args.repair && has_repairable_errors {
         info!("Active Repair Mode: Correcting false-free bitmaps with a flushed pre-image undo journal...");
         if let Ok(mut undo_journal) =
             AtomicUndoJournal::new(Some(&args.undo_file), block_size as u32)

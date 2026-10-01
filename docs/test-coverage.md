@@ -21,6 +21,7 @@ This inventory reflects the automated tests currently in the repository. It is d
 | Superblock, group descriptor, block/inode bitmap checksum corruption oracles | `test_metadata_checksum_corruption_oracle` |
 | Directory leaf and indexed HTree checksum corruption oracles | `test_directory_checksum_corruption_oracle`, `test_htree_checksum_corruption_oracle` |
 | External extent-node checksum clean/corruption oracle | `test_external_extent_block_checksum_corruption_oracle` |
+| No checksum-driven repair when metadata integrity is uncertain | `test_external_extent_block_checksum_corruption_oracle` |
 | Unsupported feature fail-closed behavior | `test_unsupported_feature_fails_closed` |
 | H-Tree root/leaf validation and child bounds | `validates_minimal_htree_root_and_leaf`, `rejects_out_of_bounds_htree_child` |
 | CUDA/CPU collision equivalence; CUDA required with env flag | `collision_detection_is_deterministic` |

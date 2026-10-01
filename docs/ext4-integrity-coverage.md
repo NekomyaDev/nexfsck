@@ -52,3 +52,8 @@ rule over UUID, group number and descriptor bytes excluding the checksum field.
 
 This matrix is intentionally conservative. Parsed or read-only supported does
 not imply parity with e2fsck recovery behavior.
+
+If any checksum failure is observed, repair mode refuses all bitmap mutations
+for that run. A checksum mismatch does not establish whether the payload or only
+the stored checksum is wrong. The extent-node corruption oracle also verifies
+that no undo journal is created and the image bytes remain unchanged.
