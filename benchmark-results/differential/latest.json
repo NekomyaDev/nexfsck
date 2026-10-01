@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "benchmarked_source_commit": "3ba27ad132ee810763b9335db0bdf34c5944e03f",
+  "benchmarked_worktree_clean": true,
+  "benchmarked_worktree_diff_sha256": null,
+  "benchmarked_binary_sha256": "5eaf909663098c500b4b2b725b0755c8aeddf5aaf72eec799c267adc06d1ee89",
+  "fixture": {
+    "size": "512 MiB",
+    "block_size": 4096,
+    "features": "has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum"
+  },
+  "clean_fixture_preserved": true,
+  "cases": [
+    {
+      "case_id": "primary_superblock_checksum",
+      "feature_set": "has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum",
+      "mutation": {
+        "byte_offset": 2044,
+        "operation": "xor byte with 0x01"
+      },
+      "nexfsck": {
+        "command": [
+          "/tmp/nexfsck-target-release/release/nexfsck",
+          "--json",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/primary_superblock_checksum.ext4"
+        ],
+        "exit_code": 4,
+        "structured_counters": null,
+        "diagnostic": "2026-10-01T20:51:46.047174Z ERROR Selected superblock checksum is invalid\n2026-10-01T20:51:46.047201Z  WARN Backup superblock candidates (checksum must be checked with --backup-sb): [32768, 98304]\n{\"superblock_checksum_failures\":1,\"errors_detected\":1}\n"
+      },
+      "e2fsck": {
+        "command": [
+          "e2fsck",
+          "-f",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/primary_superblock_checksum.ext4"
+        ],
+        "exit_code": 4,
+        "diagnostic_classification": "reported_corruption",
+        "diagnostic": "e2fsck 1.46.5 (30-Dec-2021)\next2fs_open2: Superblock checksum does not match superblock\ne2fsck: Superblock invalid, trying backup blocks...\nPass 1: Checking inodes, blocks, and sizes\nPass 2: Checking directory structure\nPass 3: Checking directory connectivity\nPass 4: Checking reference counts\nPass 5: Checking group summary information\nBlock bitmap differences:  +(32768--32832)\nFix? no\n\nFree blocks count wrong for group #1 (32703, counted=32768).\nFix? no\n\nFree blocks count wrong (124719, counted=124784).\nFix? no\n\nPadding at end of inode bitmap is not set. Fix? no\n\nInode bitmap differences: Group 1 inode bitmap does not match checksum.\nIGNORED.\nGroup 2 inode bitmap does not match checksum.\nIGNORED.\nGroup 3 inode bitmap does not match checksum.\nIGNORED.\nBlock bitmap differences: Group 1 block bitmap does not match checksum.\nIGNORED.\n\n/tmp/nexfsck-differential-fm3kq6tb/primary_superblock_checksum.ext4: ********** WARNING: Filesystem still has errors **********\n\n/tmp/nexfsck-differential-fm3kq6tb/primary_superblock_checksum.ext4: 11/32768 files (0.0% non-contiguous), 6353/131072 blocks\n"
+      },
+      "agreement": true,
+      "exit_code_agreement": true,
+      "disagreement_class": null,
+      "expected": "nexfsck detects corruption; e2fsck result is recorded as oracle data"
+    },
+    {
+      "case_id": "backup_superblock_checksum",
+      "feature_set": "has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum",
+      "mutation": {
+        "byte_offset": 134218748,
+        "operation": "xor byte with 0x01"
+      },
+      "nexfsck": {
+        "command": [
+          "/tmp/nexfsck-target-release/release/nexfsck",
+          "--json",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/backup_superblock_checksum.ext4"
+        ],
+        "exit_code": 4,
+        "structured_counters": null,
+        "diagnostic": "2026-10-01T20:51:46.262675Z  WARN Backup superblock group 1 at block 32768 has an invalid checksum\n2026-10-01T20:51:46.262685Z  INFO Backup superblocks: checked=2, valid_consistent=1, invalid_checksum=1, invalid_magic_or_unreadable=0, inconsistent=0\n{\n  \"total_block_groups\": 4,\n  \"inodes_scanned\": 8192,\n  \"active_inodes\": 4,\n  \"directory_inodes\": 2,\n  \"regular_file_inodes\": 2,\n  \"symlink_inodes\": 0,\n  \"fast_symlinks_checked\": 0,\n  \"corrupted_symlinks\": 0,\n  \"extent_trees_validated\": 3,\n  \"allocated_blocks\": 6353,\n  \"directory_entries\": 5,\n  \"extent_intervals\": 3,\n  \"corrupt_directories\": 0,\n  \"orphan_directories\": 0,\n  \"link_count_mismatches\": 0,\n  \"inode_checksum_failures\": 0,\n  \"superblock_checksum_failures\": 0,\n  \"backup_superblocks_checked\": 2,\n  \"backup_superblocks_valid_consistent\": 1,\n  \"backup_superblocks_invalid_checksum\": 1,\n  \"backup_superblocks_invalid_or_unreadable\": 0,\n  \"backup_superblocks_inconsistent\": 0,\n  \"group_descriptor_checksum_failures\": 0,\n  \"block_bitmap_checksum_failures\": 0,\n  \"inode_bitmap_checksum_failures\": 0,\n  \"directory_checksum_failures\": 0,\n  \"extent_block_checksum_failures\": 0,\n  \"xattr_block_corruptions\": 0,\n  \"xattr_checksum_failures\": 0,\n  \"extent_corruptions\": 0,\n  \"duplicate_blocks\": 0,\n  \"out_of_bounds_blocks\": 0,\n  \"false_free_blocks\": 0,\n  \"leaked_blocks\": 0,\n  \"false_free_inodes\": 0,\n  \"leaked_inodes\": 0,\n  \"journal_dirty\": false,\n  \"journal_integrity_failures\": 0,\n  \"errors_detected\": 1,\n  \"errors_corrected\": false,\n  \"repair_eligible\": false,\n  \"repair_blocked_reasons\": [\"backup_geometry_conflict\"],\n  \"elapsed_seconds\": 0.0023\n}\n"
+      },
+      "e2fsck": {
+        "command": [
+          "e2fsck",
+          "-f",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/backup_superblock_checksum.ext4"
+        ],
+        "exit_code": 0,
+        "diagnostic_classification": "no_corruption_diagnostic",
+        "diagnostic": "e2fsck 1.46.5 (30-Dec-2021)\nPass 1: Checking inodes, blocks, and sizes\nPass 2: Checking directory structure\nPass 3: Checking directory connectivity\nPass 4: Checking reference counts\nPass 5: Checking group summary information\n/tmp/nexfsck-differential-fm3kq6tb/backup_superblock_checksum.ext4: 11/32768 files (0.0% non-contiguous), 6353/131072 blocks\n"
+      },
+      "agreement": false,
+      "exit_code_agreement": false,
+      "disagreement_class": "likely_e2fsck_scope_difference",
+      "expected": "nexfsck detects corruption; e2fsck result is recorded as oracle data"
+    },
+    {
+      "case_id": "group_descriptor_checksum",
+      "feature_set": "has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum",
+      "mutation": {
+        "byte_offset": 4126,
+        "operation": "xor byte with 0x01"
+      },
+      "nexfsck": {
+        "command": [
+          "/tmp/nexfsck-target-release/release/nexfsck",
+          "--json",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/group_descriptor_checksum.ext4"
+        ],
+        "exit_code": 4,
+        "structured_counters": null,
+        "diagnostic": "2026-10-01T20:51:46.463033Z  INFO Backup superblocks: checked=2, valid_consistent=2, invalid_checksum=0, invalid_magic_or_unreadable=0, inconsistent=0\n2026-10-01T20:51:46.463045Z ERROR 1 group descriptor checksum(s) are invalid\n{\"group_descriptor_checksum_failures\":1,\"errors_detected\":1}\n"
+      },
+      "e2fsck": {
+        "command": [
+          "e2fsck",
+          "-f",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/group_descriptor_checksum.ext4"
+        ],
+        "exit_code": 0,
+        "diagnostic_classification": "reported_corruption",
+        "diagnostic": "e2fsck 1.46.5 (30-Dec-2021)\nOne or more block group descriptor checksums are invalid.  Fix? no\n\nGroup descriptor 0 checksum is 0x4f34, should be 0x4f35.  IGNORED.\nPass 1: Checking inodes, blocks, and sizes\nPass 2: Checking directory structure\nPass 3: Checking directory connectivity\nPass 4: Checking reference counts\nPass 5: Checking group summary information\n/tmp/nexfsck-differential-fm3kq6tb/group_descriptor_checksum.ext4: 11/32768 files (0.0% non-contiguous), 6353/131072 blocks\n"
+      },
+      "agreement": true,
+      "exit_code_agreement": false,
+      "disagreement_class": null,
+      "expected": "nexfsck detects corruption; e2fsck result is recorded as oracle data"
+    },
+    {
+      "case_id": "block_bitmap_payload",
+      "feature_set": "has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum",
+      "mutation": {
+        "byte_offset": 266240,
+        "operation": "xor byte with 0x01"
+      },
+      "nexfsck": {
+        "command": [
+          "/tmp/nexfsck-target-release/release/nexfsck",
+          "--json",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/block_bitmap_payload.ext4"
+        ],
+        "exit_code": 4,
+        "structured_counters": null,
+        "diagnostic": "2026-10-01T20:51:46.657955Z  INFO Backup superblocks: checked=2, valid_consistent=2, invalid_checksum=0, invalid_magic_or_unreadable=0, inconsistent=0\n{\n  \"total_block_groups\": 4,\n  \"inodes_scanned\": 8192,\n  \"active_inodes\": 4,\n  \"directory_inodes\": 2,\n  \"regular_file_inodes\": 2,\n  \"symlink_inodes\": 0,\n  \"fast_symlinks_checked\": 0,\n  \"corrupted_symlinks\": 0,\n  \"extent_trees_validated\": 3,\n  \"allocated_blocks\": 6353,\n  \"directory_entries\": 5,\n  \"extent_intervals\": 3,\n  \"corrupt_directories\": 0,\n  \"orphan_directories\": 0,\n  \"link_count_mismatches\": 0,\n  \"inode_checksum_failures\": 0,\n  \"superblock_checksum_failures\": 0,\n  \"backup_superblocks_checked\": 2,\n  \"backup_superblocks_valid_consistent\": 2,\n  \"backup_superblocks_invalid_checksum\": 0,\n  \"backup_superblocks_invalid_or_unreadable\": 0,\n  \"backup_superblocks_inconsistent\": 0,\n  \"group_descriptor_checksum_failures\": 0,\n  \"block_bitmap_checksum_failures\": 1,\n  \"inode_bitmap_checksum_failures\": 0,\n  \"directory_checksum_failures\": 0,\n  \"extent_block_checksum_failures\": 0,\n  \"xattr_block_corruptions\": 0,\n  \"xattr_checksum_failures\": 0,\n  \"extent_corruptions\": 0,\n  \"duplicate_blocks\": 0,\n  \"out_of_bounds_blocks\": 0,\n  \"false_free_blocks\": 0,\n  \"leaked_blocks\": 0,\n  \"false_free_inodes\": 0,\n  \"leaked_inodes\": 0,\n  \"journal_dirty\": false,\n  \"journal_integrity_failures\": 0,\n  \"errors_detected\": 1,\n  \"errors_corrected\": false,\n  \"repair_eligible\": false,\n  \"repair_blocked_reasons\": [\"metadata_checksum_failure\"],\n  \"elapsed_seconds\": 0.0021\n}\n"
+      },
+      "e2fsck": {
+        "command": [
+          "e2fsck",
+          "-f",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/block_bitmap_payload.ext4"
+        ],
+        "exit_code": 4,
+        "diagnostic_classification": "no_corruption_diagnostic",
+        "diagnostic": "e2fsck 1.46.5 (30-Dec-2021)\nPass 1: Checking inodes, blocks, and sizes\nPass 2: Checking directory structure\nPass 3: Checking directory connectivity\nPass 4: Checking reference counts\nPass 5: Checking group summary information\nBlock bitmap differences:  +0\nFix? no\n\nFree blocks count wrong for group #0 (30641, counted=30642).\nFix? no\n\nFree blocks count wrong (124719, counted=124720).\nFix? no\n\nBlock bitmap differences: Group 0 block bitmap does not match checksum.\nIGNORED.\n\n/tmp/nexfsck-differential-fm3kq6tb/block_bitmap_payload.ext4: ********** WARNING: Filesystem still has errors **********\n\n/tmp/nexfsck-differential-fm3kq6tb/block_bitmap_payload.ext4: 11/32768 files (0.0% non-contiguous), 6353/131072 blocks\n"
+      },
+      "agreement": true,
+      "exit_code_agreement": true,
+      "disagreement_class": null,
+      "expected": "nexfsck detects corruption; e2fsck result is recorded as oracle data"
+    },
+    {
+      "case_id": "inode_bitmap_payload",
+      "feature_set": "has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum",
+      "mutation": {
+        "byte_offset": 282624,
+        "operation": "xor byte with 0x01"
+      },
+      "nexfsck": {
+        "command": [
+          "/tmp/nexfsck-target-release/release/nexfsck",
+          "--json",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/inode_bitmap_payload.ext4"
+        ],
+        "exit_code": 4,
+        "structured_counters": null,
+        "diagnostic": "2026-10-01T20:51:46.859214Z  INFO Backup superblocks: checked=2, valid_consistent=2, invalid_checksum=0, invalid_magic_or_unreadable=0, inconsistent=0\n{\n  \"total_block_groups\": 4,\n  \"inodes_scanned\": 8192,\n  \"active_inodes\": 4,\n  \"directory_inodes\": 2,\n  \"regular_file_inodes\": 2,\n  \"symlink_inodes\": 0,\n  \"fast_symlinks_checked\": 0,\n  \"corrupted_symlinks\": 0,\n  \"extent_trees_validated\": 3,\n  \"allocated_blocks\": 6353,\n  \"directory_entries\": 5,\n  \"extent_intervals\": 3,\n  \"corrupt_directories\": 0,\n  \"orphan_directories\": 0,\n  \"link_count_mismatches\": 0,\n  \"inode_checksum_failures\": 0,\n  \"superblock_checksum_failures\": 0,\n  \"backup_superblocks_checked\": 2,\n  \"backup_superblocks_valid_consistent\": 2,\n  \"backup_superblocks_invalid_checksum\": 0,\n  \"backup_superblocks_invalid_or_unreadable\": 0,\n  \"backup_superblocks_inconsistent\": 0,\n  \"group_descriptor_checksum_failures\": 0,\n  \"block_bitmap_checksum_failures\": 0,\n  \"inode_bitmap_checksum_failures\": 1,\n  \"directory_checksum_failures\": 0,\n  \"extent_block_checksum_failures\": 0,\n  \"xattr_block_corruptions\": 0,\n  \"xattr_checksum_failures\": 0,\n  \"extent_corruptions\": 0,\n  \"duplicate_blocks\": 0,\n  \"out_of_bounds_blocks\": 0,\n  \"false_free_blocks\": 0,\n  \"leaked_blocks\": 0,\n  \"false_free_inodes\": 0,\n  \"leaked_inodes\": 0,\n  \"journal_dirty\": false,\n  \"journal_integrity_failures\": 0,\n  \"errors_detected\": 1,\n  \"errors_corrected\": false,\n  \"repair_eligible\": false,\n  \"repair_blocked_reasons\": [\"metadata_checksum_failure\"],\n  \"elapsed_seconds\": 0.0021\n}\n"
+      },
+      "e2fsck": {
+        "command": [
+          "e2fsck",
+          "-f",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/inode_bitmap_payload.ext4"
+        ],
+        "exit_code": 4,
+        "diagnostic_classification": "no_corruption_diagnostic",
+        "diagnostic": "e2fsck 1.46.5 (30-Dec-2021)\nPass 1: Checking inodes, blocks, and sizes\nPass 2: Checking directory structure\nPass 3: Checking directory connectivity\nPass 4: Checking reference counts\nPass 5: Checking group summary information\nInode bitmap differences:  +1\nFix? no\n\nFree inodes count wrong for group #0 (8181, counted=8182).\nFix? no\n\nFree inodes count wrong (32757, counted=32758).\nFix? no\n\nInode bitmap differences: Group 0 inode bitmap does not match checksum.\nIGNORED.\n\n/tmp/nexfsck-differential-fm3kq6tb/inode_bitmap_payload.ext4: ********** WARNING: Filesystem still has errors **********\n\n/tmp/nexfsck-differential-fm3kq6tb/inode_bitmap_payload.ext4: 11/32768 files (0.0% non-contiguous), 6353/131072 blocks\n"
+      },
+      "agreement": true,
+      "exit_code_agreement": true,
+      "disagreement_class": null,
+      "expected": "nexfsck detects corruption; e2fsck result is recorded as oracle data"
+    },
+    {
+      "case_id": "inode_checksum",
+      "feature_set": "has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum",
+      "mutation": {
+        "byte_offset": 299388,
+        "operation": "xor byte with 0x01"
+      },
+      "nexfsck": {
+        "command": [
+          "/tmp/nexfsck-target-release/release/nexfsck",
+          "--json",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/inode_checksum.ext4"
+        ],
+        "exit_code": 4,
+        "structured_counters": null,
+        "diagnostic": "2026-10-01T20:51:47.062318Z  INFO Backup superblocks: checked=2, valid_consistent=2, invalid_checksum=0, invalid_magic_or_unreadable=0, inconsistent=0\n{\n  \"total_block_groups\": 4,\n  \"inodes_scanned\": 8192,\n  \"active_inodes\": 4,\n  \"directory_inodes\": 2,\n  \"regular_file_inodes\": 2,\n  \"symlink_inodes\": 0,\n  \"fast_symlinks_checked\": 0,\n  \"corrupted_symlinks\": 0,\n  \"extent_trees_validated\": 3,\n  \"allocated_blocks\": 6353,\n  \"directory_entries\": 5,\n  \"extent_intervals\": 3,\n  \"corrupt_directories\": 0,\n  \"orphan_directories\": 0,\n  \"link_count_mismatches\": 0,\n  \"inode_checksum_failures\": 1,\n  \"superblock_checksum_failures\": 0,\n  \"backup_superblocks_checked\": 2,\n  \"backup_superblocks_valid_consistent\": 2,\n  \"backup_superblocks_invalid_checksum\": 0,\n  \"backup_superblocks_invalid_or_unreadable\": 0,\n  \"backup_superblocks_inconsistent\": 0,\n  \"group_descriptor_checksum_failures\": 0,\n  \"block_bitmap_checksum_failures\": 0,\n  \"inode_bitmap_checksum_failures\": 0,\n  \"directory_checksum_failures\": 0,\n  \"extent_block_checksum_failures\": 0,\n  \"xattr_block_corruptions\": 0,\n  \"xattr_checksum_failures\": 0,\n  \"extent_corruptions\": 0,\n  \"duplicate_blocks\": 0,\n  \"out_of_bounds_blocks\": 0,\n  \"false_free_blocks\": 0,\n  \"leaked_blocks\": 0,\n  \"false_free_inodes\": 0,\n  \"leaked_inodes\": 0,\n  \"journal_dirty\": false,\n  \"journal_integrity_failures\": 0,\n  \"errors_detected\": 1,\n  \"errors_corrected\": false,\n  \"repair_eligible\": false,\n  \"repair_blocked_reasons\": [\"metadata_checksum_failure\"],\n  \"elapsed_seconds\": 0.0021\n}\n"
+      },
+      "e2fsck": {
+        "command": [
+          "e2fsck",
+          "-f",
+          "-n",
+          "/tmp/nexfsck-differential-fm3kq6tb/inode_checksum.ext4"
+        ],
+        "exit_code": 4,
+        "diagnostic_classification": "no_corruption_diagnostic",
+        "diagnostic": "e2fsck 1.46.5 (30-Dec-2021)\nPass 1: Checking inodes, blocks, and sizes\nInode 2 passes checks, but checksum does not match inode.  Fix? no\n\nPass 2: Checking directory structure\nDirectory inode 2, block #0: directory passes checks but fails checksum.\nFix? no\n\nPass 3: Checking directory connectivity\nPass 4: Checking reference counts\nPass 5: Checking group summary information\n\n/tmp/nexfsck-differential-fm3kq6tb/inode_checksum.ext4: ********** WARNING: Filesystem still has errors **********\n\n/tmp/nexfsck-differential-fm3kq6tb/inode_checksum.ext4: 11/32768 files (0.0% non-contiguous), 6353/131072 blocks\n"
+      },
+      "agreement": true,
+      "exit_code_agreement": true,
+      "disagreement_class": null,
+      "expected": "nexfsck detects corruption; e2fsck result is recorded as oracle data"
+    }
+  ],
+  "not_yet_covered": [
+    "inode_structure",
+    "extent_root",
+    "extent_internal_node",
+    "extent_leaf",
+    "directory_dirent",
+    "directory_checksum",
+    "htree",
+    "external_xattr",
+    "mmp",
+    "jbd2_descriptor",
+    "jbd2_commit",
+    "jbd2_revoke"
+  ],
+  "summary": {
+    "total": 6,
+    "agreement": 5,
+    "disagreement": 1
+  }
+}
