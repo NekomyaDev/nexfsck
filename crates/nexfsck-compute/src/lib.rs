@@ -12,8 +12,132 @@ use std::sync::RwLock;
 use zerocopy::FromBytes;
 
 use nexfsck_core::{
-    Ext4DirEntry2Header, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, Ext4Inode, EXT4_FT_DIR_CSUM,
+    Ext4DirEntry2Header, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, Ext4Inode, Ext4Superblock,
+    EXT4_FEATURE_INCOMPAT_CSUM_SEED, EXT4_FEATURE_RO_COMPAT_METADATA_CSUM, EXT4_FT_DIR_CSUM,
 };
+
+const INODE_GENERATION_OFFSET: usize = 100;
+const INODE_CHECKSUM_LO_OFFSET: usize = 124;
+const INODE_EXTRA_ISIZE_OFFSET: usize = 128;
+const INODE_CHECKSUM_HI_OFFSET: usize = 130;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InodeChecksumResult {
+    NotEnabled,
+    Valid,
+    Invalid { provided: u32, calculated: u32 },
+}
+
+/// Precomputed filesystem-level state for validating every inode in a table.
+/// The checksum seed is invariant for the filesystem and must not be rebuilt
+/// for each inode in a hot scan loop.
+#[derive(Debug, Clone, Copy)]
+pub struct InodeChecksumVerifier {
+    enabled: bool,
+    inode_size: usize,
+    seed: u32,
+}
+
+impl InodeChecksumVerifier {
+    pub fn new(superblock: &Ext4Superblock) -> Self {
+        let enabled = superblock.has_ro_compat_feature(EXT4_FEATURE_RO_COMPAT_METADATA_CSUM);
+        let seed = if superblock.has_incompat_feature(EXT4_FEATURE_INCOMPAT_CSUM_SEED) {
+            u32::from_le(superblock.s_checksum_seed)
+        } else {
+            ext4_crc32c(u32::MAX, &superblock.s_uuid)
+        };
+        Self {
+            enabled,
+            inode_size: superblock.inode_size() as usize,
+            seed,
+        }
+    }
+
+    pub fn verify(&self, inode_number: u32, raw_inode: &[u8]) -> InodeChecksumResult {
+        if !self.enabled {
+            return InodeChecksumResult::NotEnabled;
+        }
+        if raw_inode.len() < self.inode_size || self.inode_size < 128 {
+            return InodeChecksumResult::Invalid {
+                provided: 0,
+                calculated: 0,
+            };
+        }
+        let raw_inode = &raw_inode[..self.inode_size];
+        let low = u16::from_le_bytes([
+            raw_inode[INODE_CHECKSUM_LO_OFFSET],
+            raw_inode[INODE_CHECKSUM_LO_OFFSET + 1],
+        ]) as u32;
+        let extra_isize = if self.inode_size > 128 && raw_inode.len() >= 132 {
+            u16::from_le_bytes([
+                raw_inode[INODE_EXTRA_ISIZE_OFFSET],
+                raw_inode[INODE_EXTRA_ISIZE_OFFSET + 1],
+            ]) as usize
+        } else {
+            0
+        };
+        let has_high = self.inode_size > 128 && extra_isize >= 4 && raw_inode.len() >= 132;
+        let provided = if has_high {
+            low | ((u16::from_le_bytes([
+                raw_inode[INODE_CHECKSUM_HI_OFFSET],
+                raw_inode[INODE_CHECKSUM_HI_OFFSET + 1],
+            ]) as u32)
+                << 16)
+        } else {
+            low
+        };
+
+        let inode_number_bytes = inode_number.to_le_bytes();
+        let zero = [0u8; 2];
+        let mut calculated = if has_high {
+            crc32c_chain(
+                self.seed,
+                &[
+                    &inode_number_bytes,
+                    &raw_inode[INODE_GENERATION_OFFSET..INODE_GENERATION_OFFSET + 4],
+                    &raw_inode[..INODE_CHECKSUM_LO_OFFSET],
+                    &zero,
+                    &raw_inode[INODE_CHECKSUM_LO_OFFSET + 2..INODE_CHECKSUM_HI_OFFSET],
+                    &zero,
+                    &raw_inode[INODE_CHECKSUM_HI_OFFSET + 2..],
+                ],
+            )
+        } else {
+            crc32c_chain(
+                self.seed,
+                &[
+                    &inode_number_bytes,
+                    &raw_inode[INODE_GENERATION_OFFSET..INODE_GENERATION_OFFSET + 4],
+                    &raw_inode[..INODE_CHECKSUM_LO_OFFSET],
+                    &zero,
+                    &raw_inode[INODE_CHECKSUM_LO_OFFSET + 2..],
+                ],
+            )
+        };
+        if !has_high {
+            calculated &= 0xffff;
+        }
+
+        if provided == calculated || raw_inode[..128].iter().all(|byte| *byte == 0) {
+            InodeChecksumResult::Valid
+        } else {
+            InodeChecksumResult::Invalid {
+                provided,
+                calculated,
+            }
+        }
+    }
+}
+
+/// Implements the ext2fs_inode_csum_verify algorithm over the complete raw
+/// on-disk inode, including the e2fsprogs all-zero unused-inode exception.
+pub fn verify_inode_checksum(
+    superblock: &Ext4Superblock,
+    inode_number: u32,
+    raw_inode: &[u8],
+) -> InodeChecksumResult {
+    InodeChecksumVerifier::new(superblock).verify(inode_number, raw_inode)
+}
 
 /// Hardware profile detected at startup.
 #[derive(Debug, Clone)]
@@ -96,6 +220,29 @@ pub fn ext4_crc32c(seed: u32, data: &[u8]) -> u32 {
     crc32c_scalar(seed, data)
 }
 
+fn crc32c_chain(mut seed: u32, segments: &[&[u8]]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("sse4.2") {
+        for segment in segments {
+            // SAFETY: guarded by runtime feature detection once for the chain.
+            seed = unsafe { crc32c_x86(seed, segment) };
+        }
+        return seed;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        for segment in segments {
+            // SAFETY: guarded by runtime feature detection once for the chain.
+            seed = unsafe { crc32c_arm(seed, segment) };
+        }
+        return seed;
+    }
+    for segment in segments {
+        seed = crc32c_scalar(seed, segment);
+    }
+    seed
+}
+
 fn crc32c_scalar(mut crc: u32, data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= byte as u32;
@@ -140,6 +287,69 @@ unsafe fn crc32c_arm(mut crc: u32, mut data: &[u8]) -> u32 {
 mod crc_tests {
     use super::*;
 
+    fn test_superblock(inode_size: u16, explicit_seed: Option<u32>) -> Ext4Superblock {
+        let bytes = [0u8; 1024];
+        let (superblock, _) = Ext4Superblock::ref_from_prefix(&bytes).unwrap();
+        let mut superblock = *superblock;
+        superblock.s_inode_size = inode_size.to_le();
+        superblock.s_feature_ro_compat = EXT4_FEATURE_RO_COMPAT_METADATA_CSUM.to_le();
+        superblock.s_uuid = [
+            0x52, 0x66, 0x8f, 0x3c, 0x91, 0x47, 0x44, 0xbd, 0xb8, 0x23, 0xf6, 0x3f, 0xb5, 0xe6,
+            0x2d, 0x69,
+        ];
+        if let Some(seed) = explicit_seed {
+            superblock.s_feature_incompat = EXT4_FEATURE_INCOMPAT_CSUM_SEED.to_le();
+            superblock.s_checksum_seed = seed.to_le();
+        }
+        superblock
+    }
+
+    fn reference_inode_checksum(
+        superblock: &Ext4Superblock,
+        inode_number: u32,
+        raw_inode: &[u8],
+    ) -> (u32, bool) {
+        let mut copy = raw_inode.to_vec();
+        copy[INODE_CHECKSUM_LO_OFFSET..INODE_CHECKSUM_LO_OFFSET + 2].fill(0);
+        let extra_isize = if copy.len() > 128 {
+            u16::from_le_bytes([
+                copy[INODE_EXTRA_ISIZE_OFFSET],
+                copy[INODE_EXTRA_ISIZE_OFFSET + 1],
+            ]) as usize
+        } else {
+            0
+        };
+        let has_high = copy.len() > 128 && extra_isize >= 4;
+        if has_high {
+            copy[INODE_CHECKSUM_HI_OFFSET..INODE_CHECKSUM_HI_OFFSET + 2].fill(0);
+        }
+        let seed = if superblock.has_incompat_feature(EXT4_FEATURE_INCOMPAT_CSUM_SEED) {
+            u32::from_le(superblock.s_checksum_seed)
+        } else {
+            ext4_crc32c(u32::MAX, &superblock.s_uuid)
+        };
+        let mut crc = ext4_crc32c(seed, &inode_number.to_le_bytes());
+        crc = ext4_crc32c(
+            crc,
+            &raw_inode[INODE_GENERATION_OFFSET..INODE_GENERATION_OFFSET + 4],
+        );
+        crc = ext4_crc32c(crc, &copy);
+        if !has_high {
+            crc &= 0xffff;
+        }
+        (crc, has_high)
+    }
+
+    fn install_inode_checksum(superblock: &Ext4Superblock, inode_number: u32, raw: &mut [u8]) {
+        let (checksum, has_high) = reference_inode_checksum(superblock, inode_number, raw);
+        raw[INODE_CHECKSUM_LO_OFFSET..INODE_CHECKSUM_LO_OFFSET + 2]
+            .copy_from_slice(&(checksum as u16).to_le_bytes());
+        if has_high {
+            raw[INODE_CHECKSUM_HI_OFFSET..INODE_CHECKSUM_HI_OFFSET + 2]
+                .copy_from_slice(&((checksum >> 16) as u16).to_le_bytes());
+        }
+    }
+
     #[test]
     fn crc32c_known_vector() {
         assert_eq!(ext4_crc32c(0xffff_ffff, b"123456789"), 0x1cf9_6d7c);
@@ -156,6 +366,89 @@ mod crc_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn inode_checksum_matches_independent_reference_across_layouts_and_seeds() {
+        let mut state = 0x7e57_1a2b_3c4d_5e6fu64;
+        for inode_size in [128u16, 256, 512] {
+            for explicit_seed in [None, Some(0x1234_5678)] {
+                let superblock = test_superblock(inode_size, explicit_seed);
+                for inode_number in [1u32, 2, 11, 12, 65_537, u32::MAX] {
+                    let mut raw = vec![0u8; inode_size as usize];
+                    for byte in &mut raw {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        *byte = state as u8;
+                    }
+                    if inode_size > 128 {
+                        raw[INODE_EXTRA_ISIZE_OFFSET..INODE_EXTRA_ISIZE_OFFSET + 2]
+                            .copy_from_slice(&32u16.to_le_bytes());
+                    }
+                    install_inode_checksum(&superblock, inode_number, &mut raw);
+                    assert_eq!(
+                        verify_inode_checksum(&superblock, inode_number, &raw),
+                        InodeChecksumResult::Valid
+                    );
+
+                    raw[40] ^= 0x80;
+                    assert!(matches!(
+                        verify_inode_checksum(&superblock, inode_number, &raw),
+                        InodeChecksumResult::Invalid { .. }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inode_checksum_covers_number_generation_and_stored_fields() {
+        let superblock = test_superblock(256, None);
+        let mut raw = vec![0x5au8; 256];
+        raw[INODE_EXTRA_ISIZE_OFFSET..INODE_EXTRA_ISIZE_OFFSET + 2]
+            .copy_from_slice(&32u16.to_le_bytes());
+        raw[INODE_GENERATION_OFFSET..INODE_GENERATION_OFFSET + 4]
+            .copy_from_slice(&0x89ab_cdefu32.to_le_bytes());
+        install_inode_checksum(&superblock, 42, &mut raw);
+        assert_eq!(
+            verify_inode_checksum(&superblock, 42, &raw),
+            InodeChecksumResult::Valid
+        );
+        assert!(matches!(
+            verify_inode_checksum(&superblock, 43, &raw),
+            InodeChecksumResult::Invalid { .. }
+        ));
+
+        let mut changed_generation = raw.clone();
+        changed_generation[INODE_GENERATION_OFFSET] ^= 1;
+        assert!(matches!(
+            verify_inode_checksum(&superblock, 42, &changed_generation),
+            InodeChecksumResult::Invalid { .. }
+        ));
+
+        let mut changed_checksum = raw;
+        changed_checksum[INODE_CHECKSUM_HI_OFFSET] ^= 1;
+        assert!(matches!(
+            verify_inode_checksum(&superblock, 42, &changed_checksum),
+            InodeChecksumResult::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn inode_checksum_feature_and_unused_inode_semantics_match_e2fsprogs() {
+        let mut disabled = test_superblock(256, None);
+        disabled.s_feature_ro_compat = 0;
+        assert_eq!(
+            verify_inode_checksum(&disabled, 12, &[0xa5; 256]),
+            InodeChecksumResult::NotEnabled
+        );
+
+        let enabled = test_superblock(256, None);
+        assert_eq!(
+            verify_inode_checksum(&enabled, 12, &[0; 256]),
+            InodeChecksumResult::Valid
+        );
     }
 }
 
@@ -176,6 +469,7 @@ pub struct InodeVerificationStats {
     pub corrupt_directories: AtomicU64,
     pub orphan_directories: AtomicU64,
     pub link_count_mismatches: AtomicU64,
+    pub inode_checksum_failures: AtomicU64,
 }
 
 impl InodeVerificationStats {

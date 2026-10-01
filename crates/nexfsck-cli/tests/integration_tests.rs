@@ -1,6 +1,167 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+fn unique_test_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("nexfsck-{name}-{}", std::process::id()))
+}
+
+fn inode_location(image: &Path, inode: u32) -> (u64, u64) {
+    let output = Command::new("debugfs")
+        .args(["-R", &format!("imap <{inode}>"), image.to_str().unwrap()])
+        .output()
+        .expect("debugfs imap must run");
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let location = text
+        .lines()
+        .find(|line| line.contains("located at block"))
+        .unwrap_or_else(|| panic!("debugfs imap location missing: {text}"));
+    let after_block = location.split("located at block").nth(1).unwrap().trim();
+    let (block, offset) = after_block.split_once(',').unwrap();
+    let block = block.trim().parse::<u64>().unwrap();
+    let offset = offset.split("offset").nth(1).unwrap().trim();
+    let offset = u64::from_str_radix(offset.trim_start_matches("0x"), 16).unwrap();
+    (block, offset)
+}
+
+fn run_nexfsck_json(image: &Path) -> (i32, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_nexfsck"))
+        .args(["--json", "-n", image.to_str().unwrap()])
+        .output()
+        .expect("nexfsck must run");
+    (
+        output.status.code().expect("normal nexfsck exit"),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+fn flip_image_byte(image: &Path, byte_offset: u64) {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image)
+        .unwrap();
+    file.seek(SeekFrom::Start(byte_offset)).unwrap();
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte).unwrap();
+    byte[0] ^= 0x01;
+    file.seek(SeekFrom::Start(byte_offset)).unwrap();
+    file.write_all(&byte).unwrap();
+    file.sync_all().unwrap();
+}
+
+#[test]
+fn test_real_ext4_inode_checksum_clean_layouts_and_seed_modes() {
+    for (label, inode_size, features) in [
+        ("inode-csum-128", "128", "metadata_csum"),
+        ("inode-csum-256", "256", "metadata_csum"),
+        ("inode-csum-seed", "256", "metadata_csum,metadata_csum_seed"),
+    ] {
+        let image = unique_test_path(&format!("{label}.img"));
+        assert!(Command::new("truncate")
+            .args(["-s", "64M", image.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("mkfs.ext4")
+            .args([
+                "-q",
+                "-F",
+                "-I",
+                inode_size,
+                "-O",
+                features,
+                image.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let (code, stdout) = run_nexfsck_json(&image);
+        assert_eq!(code, 0, "{label}: {stdout}");
+        assert!(stdout.contains("\"inode_checksum_failures\": 0"));
+        assert!(Command::new("e2fsck")
+            .args(["-f", "-n", image.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::remove_file(image).unwrap();
+    }
+}
+
+#[test]
+fn test_real_ext4_inode_checksum_corruption_matches_e2fsprogs() {
+    let clean = unique_test_path("inode-csum-clean.img");
+    let payload = unique_test_path("inode-csum-payload");
+    std::fs::write(&payload, b"nexfsck inode checksum oracle\n").unwrap();
+    assert!(Command::new("truncate")
+        .args(["-s", "64M", clean.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-I",
+            "256",
+            "-O",
+            "metadata_csum",
+            clean.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let debugfs = Command::new("debugfs")
+        .args([
+            "-w",
+            "-R",
+            &format!("write {} /checked", payload.display()),
+            clean.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(debugfs.status.success());
+    let debugfs_text = String::from_utf8_lossy(&debugfs.stdout);
+    let inode = debugfs_text
+        .split("Allocated inode:")
+        .nth(1)
+        .expect("allocated inode output")
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let (block, offset) = inode_location(&clean, inode);
+    let inode_start = block * 4096 + offset;
+
+    for (label, relative_offset) in [
+        ("metadata", 40u64),
+        ("generation", 100u64),
+        ("stored-checksum", 124u64),
+    ] {
+        let corrupt = unique_test_path(&format!("inode-csum-{label}.img"));
+        std::fs::copy(&clean, &corrupt).unwrap();
+        flip_image_byte(&corrupt, inode_start + relative_offset);
+        let (code, stdout) = run_nexfsck_json(&corrupt);
+        assert_eq!(code, 4, "{label}: {stdout}");
+        assert!(
+            stdout.contains("\"inode_checksum_failures\": 1"),
+            "{label}: {stdout}"
+        );
+        let e2fsck = Command::new("e2fsck")
+            .args(["-f", "-n", corrupt.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_ne!(e2fsck.status.code(), Some(0), "e2fsck accepted {label}");
+        std::fs::remove_file(corrupt).unwrap();
+    }
+    std::fs::remove_file(clean).unwrap();
+    std::fs::remove_file(payload).unwrap();
+}
 
 #[test]
 fn test_clean_ext4_image_verification() {

@@ -10,6 +10,7 @@ Performs:
 
 import concurrent.futures
 import datetime
+import hashlib
 import json
 import os
 import platform
@@ -35,6 +36,25 @@ BACKEND_MODES = {
     "sync_cpu": ["--io-backend", "sync", "--compute-backend", "cpu"],
     "adaptive": [],
 }
+
+def source_provenance():
+    repo = "/home/pop-os/nexfsck"
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo, text=True
+    )
+    diff = subprocess.check_output(["git", "diff", "--binary", "HEAD"], cwd=repo)
+    return {
+        "benchmarked_source_commit": commit,
+        "benchmarked_worktree_clean": not bool(status.strip()),
+        "benchmarked_worktree_diff_sha256": hashlib.sha256(diff).hexdigest() if diff else None,
+        # A commit cannot contain its own hash. Consumers resolve the publication
+        # commit from Git history using the documented command instead.
+        "artifact_publication_commit": None,
+        "artifact_publication_commit_resolution": (
+            "git log -1 --format=%H -- benchmark-results/latest.json"
+        ),
+    }
 
 def percentile(values, fraction):
     ordered = sorted(values)
@@ -420,6 +440,7 @@ def run_fuzzing_and_repair_test():
     }
 
 def main():
+    provenance = source_provenance()
     print("=" * 70)
     print("  NEXFSCK 10.0 GiB ENTERPRISE STRESS & ENDURANCE VERIFICATION")
     print("  Real Data • 80 Block Groups • 100k+ Inodes • Memory Profiling • Fuzzing")
@@ -432,9 +453,9 @@ def main():
         endurance = run_endurance_stress_test()
         repair = run_fuzzing_and_repair_test()
         result = {
-            "schema_version": 1,
+            "schema_version": 2,
             "generated_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd="/home/pop-os/nexfsck", text=True).strip(),
+            "provenance": provenance,
             "fixture": {
                 "logical_bytes": os.path.getsize(IMG_PATH),
                 "logical_gib": os.path.getsize(IMG_PATH) / (1024 ** 3),

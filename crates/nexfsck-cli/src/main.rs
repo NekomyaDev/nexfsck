@@ -12,7 +12,7 @@ use nexfsck_compute::{
     collect_directory_blocks, collect_inode_extents, reconcile_block_bitmap,
     reconcile_inode_bitmap, verify_directory_block_compact, verify_htree_directory,
     verify_inodes_parallel, BitmapDiscrepancy, BlockAllocationTracker, HardwareProfile,
-    InodeBitmapDiscrepancy, InodeVerificationStats,
+    InodeBitmapDiscrepancy, InodeChecksumResult, InodeChecksumVerifier, InodeVerificationStats,
 };
 use nexfsck_gpu::{BlockInterval, GpuAccelerator};
 use nexfsck_io::{BlockDevice, IoBackend};
@@ -399,7 +399,9 @@ fn main() -> ExitCode {
     let mut inode_decode_time = Duration::ZERO;
     let mut inode_metadata_collection_time = Duration::ZERO;
     let mut inode_validation_tracking_time = Duration::ZERO;
+    let mut inode_checksum_time = Duration::ZERO;
     let mut inactive_inode_count = 0u64;
+    let inode_checksum_verifier = InodeChecksumVerifier::new(&sb);
 
     for (bg_idx, desc) in group_descriptors.iter().enumerate() {
         let free_inodes = desc.free_inodes_count(is_64bit);
@@ -424,6 +426,21 @@ fn main() -> ExitCode {
         inode_table_read_time += operation_started.elapsed();
         match table_result {
             Ok(table_bytes) => {
+                let operation_started = Instant::now();
+                let inode_size = sb.inode_size() as usize;
+                let first_inode = (bg_idx as u32) * sb.inodes_per_group() + 1;
+                for (index, raw_inode) in table_bytes.chunks_exact(inode_size).enumerate() {
+                    if matches!(
+                        inode_checksum_verifier.verify(first_inode + index as u32, raw_inode),
+                        InodeChecksumResult::Invalid { .. }
+                    ) {
+                        inode_stats
+                            .inode_checksum_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        group_had_error = true;
+                    }
+                }
+                inode_checksum_time += operation_started.elapsed();
                 let operation_started = Instant::now();
                 let inodes =
                     BlockDevice::parse_inodes_from_table(&table_bytes, sb.inode_size() as usize);
@@ -483,6 +500,7 @@ fn main() -> ExitCode {
     profile.mark("inode_table_scanning_extent_tree_parsing");
     profile.record("inode_table_reads", inode_table_read_time);
     profile.record("inode_decoding", inode_decode_time);
+    profile.record("inode_checksum_total", inode_checksum_time);
     profile.record(
         "inode_metadata_extent_collection",
         inode_metadata_collection_time,
@@ -757,6 +775,7 @@ fn main() -> ExitCode {
     let corrupt_symlinks = inode_stats.corrupted_symlinks.load(Ordering::Relaxed);
     let orphan_dirs = inode_stats.orphan_directories.load(Ordering::Relaxed);
     let link_mismatches = inode_stats.link_count_mismatches.load(Ordering::Relaxed);
+    let inode_checksum_failures = inode_stats.inode_checksum_failures.load(Ordering::Relaxed);
 
     stats.errors_found += corruptions
         + duplicates
@@ -765,6 +784,7 @@ fn main() -> ExitCode {
         + corrupt_dirs
         + orphan_dirs
         + link_mismatches
+        + inode_checksum_failures
         + total_block_discrepancy.false_free_blocks
         + total_inode_discrepancy.false_free_inodes
         + dev.media_errors();
@@ -940,6 +960,10 @@ fn main() -> ExitCode {
         println!("  \"corrupt_directories\": {},", corrupt_dirs);
         println!("  \"orphan_directories\": {},", orphan_dirs);
         println!("  \"link_count_mismatches\": {},", link_mismatches);
+        println!(
+            "  \"inode_checksum_failures\": {},",
+            inode_checksum_failures
+        );
         println!("  \"extent_corruptions\": {},", corruptions);
         println!("  \"duplicate_blocks\": {},", duplicates);
         println!("  \"out_of_bounds_blocks\": {},", oob);
@@ -1005,6 +1029,7 @@ fn main() -> ExitCode {
         println!("Corrupt Directories: {}", corrupt_dirs);
         println!("Orphan Directories : {}", orphan_dirs);
         println!("Link Discrepancies : {}", link_mismatches);
+        println!("Inode Csum Failures: {}", inode_checksum_failures);
         println!("Extent Corruptions : {}", corruptions);
         println!("Duplicate Blocks   : {}", duplicates);
         println!("Out-of-Bounds Blks : {}", oob);
