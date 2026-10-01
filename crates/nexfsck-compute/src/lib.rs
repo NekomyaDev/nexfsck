@@ -257,7 +257,7 @@ pub fn verify_inodes_parallel<F>(
         .total_inodes_scanned
         .fetch_add(inodes.len() as u64, Ordering::Relaxed);
 
-    inodes.par_iter().for_each(|inode| {
+    let verify = |inode: &Ext4Inode| {
         if !inode.is_used() {
             return;
         }
@@ -299,7 +299,16 @@ pub fn verify_inodes_parallel<F>(
                 }
             }
         }
-    });
+    };
+
+    // Typical ext4 group-sized batches (8K inodes in the benchmark fixture)
+    // are faster serially because extent accounting writes through one shared
+    // tracker. Rayon remains useful for unusually large batches.
+    if inodes.len() <= 16_384 {
+        inodes.iter().for_each(verify);
+    } else {
+        inodes.par_iter().for_each(verify);
+    }
 }
 
 /// Discrepancy statistics when comparing on-disk inode bitmaps against in-memory inodes.

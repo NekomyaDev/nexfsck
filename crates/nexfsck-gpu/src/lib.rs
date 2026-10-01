@@ -22,6 +22,16 @@ pub struct BlockInterval {
     pub block_count: u32,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct CollisionProfile {
+    pub sort: std::time::Duration,
+    pub host_preparation_and_copy: std::time::Duration,
+    pub kernel_launch: std::time::Duration,
+    pub gpu_synchronization: std::time::Duration,
+    pub copy_back: std::time::Duration,
+    pub cpu_revalidation: std::time::Duration,
+}
+
 /// GPU device probe with CPU interval processing.
 pub struct GpuAccelerator {
     backend: GpuBackend,
@@ -32,6 +42,17 @@ pub struct GpuAccelerator {
 }
 
 impl GpuAccelerator {
+    /// A zero-cost CPU-only accelerator. This avoids loading the CUDA driver.
+    pub fn cpu_only() -> Self {
+        Self {
+            backend: GpuBackend::None,
+            device_name: "CPU collision backend".into(),
+            vram_bytes: 0,
+            #[cfg(target_os = "linux")]
+            cuda: None,
+        }
+    }
+
     /// Probes for visible GPU devices and queries model/memory information where possible.
     pub fn probe() -> Self {
         #[cfg(target_os = "linux")]
@@ -87,18 +108,35 @@ impl GpuAccelerator {
         &self,
         intervals: &mut [BlockInterval],
     ) -> Vec<(BlockInterval, BlockInterval)> {
+        self.find_interval_collisions_profiled(intervals).0
+    }
+
+    pub fn find_interval_collisions_profiled(
+        &self,
+        intervals: &mut [BlockInterval],
+    ) -> (Vec<(BlockInterval, BlockInterval)>, CollisionProfile) {
+        let mut profile = CollisionProfile::default();
         if intervals.len() < 2 {
-            return Vec::new();
+            return (Vec::new(), profile);
         }
 
         // Sorting remains on the host; collision candidate generation is dispatched
         // to CUDA when available and deterministically revalidated on the CPU.
+        let started = std::time::Instant::now();
         intervals.sort_unstable_by_key(|i| i.start_block);
+        profile.sort = started.elapsed();
 
         #[cfg(target_os = "linux")]
         if let Some(cuda) = &self.cuda {
-            if let Ok(candidate_indices) = cuda.find_collision_candidates(intervals) {
-                return candidate_indices
+            if let Ok((candidate_indices, timings)) =
+                cuda.find_collision_candidates_profiled(intervals)
+            {
+                profile.host_preparation_and_copy = timings[0];
+                profile.kernel_launch = timings[1];
+                profile.gpu_synchronization = timings[2];
+                profile.copy_back = timings[3];
+                let started = std::time::Instant::now();
+                let collisions = candidate_indices
                     .into_iter()
                     .filter_map(|index| {
                         let current = intervals.get(index).copied()?;
@@ -110,6 +148,8 @@ impl GpuAccelerator {
                             .then_some((current, next))
                     })
                     .collect();
+                profile.cpu_revalidation = started.elapsed();
+                return (collisions, profile);
             }
         }
 
@@ -123,7 +163,7 @@ impl GpuAccelerator {
             }
         }
 
-        collisions
+        (collisions, profile)
     }
 }
 
@@ -156,23 +196,8 @@ fn probe_nvidia() -> Option<(String, u64)> {
         }
     }
 
-    // 2. Query exact VRAM capacity from nvidia-smi if available
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(text) = std::str::from_utf8(&output.stdout) {
-                if let Some(first_line) = text.lines().next() {
-                    if let Ok(mib) = first_line.trim().parse::<u64>() {
-                        vram_bytes = mib * 1024 * 1024;
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Fallback to PCI BAR aperture from sysfs if nvidia-smi unavailable
+    // Querying nvidia-smi adds a process launch to every fsck. The PCI BAR is
+    // sufficient for diagnostics and keeps discovery entirely in-process.
     if vram_bytes == 0 {
         if let Ok(entries) = std::fs::read_dir("/sys/bus/pci/devices") {
             for entry in entries.flatten() {

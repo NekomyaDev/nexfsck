@@ -13,9 +13,9 @@
 
 | Area | Current state |
 | --- | --- |
-| I/O | `io_uring` batched reads with queue depth 128 and persistent registered buffers (up to 64 KiB per request) when the kernel permits it; ordinary-buffer/POSIX fallback otherwise. Runtime output reports whether registration succeeded. |
+| I/O | Adaptive selection uses synchronous reads for regular image files and `io_uring` for block devices. Explicit `--io-backend sync|uring` overrides are available. The `io_uring` path uses queue depth 128 and persistent registered buffers when permitted. |
 | Compute | Rayon parallel inode/extent validation. ext4 CRC32c uses runtime-dispatched x86 SSE4.2 or ARMv8 CRC instructions with a scalar Castagnoli fallback and equivalence tests. AVX-512-specific validation kernels are not used. |
-| GPU | Pass 1 extent intervals are dispatched through an optional dynamically loaded CUDA Driver PTX collision kernel, then every candidate is revalidated on CPU. Runtime logs report the selected backend, interval count, and candidate count. CPU fallback is automatic. |
+| GPU | The optional `--compute-backend cuda` path dispatches extent intervals through a dynamically loaded CUDA Driver PTX kernel, then revalidates candidates on CPU. Calibration found no end-to-end CUDA crossover through 10 million intervals on the measured RTX 4060 system, so adaptive mode currently selects CPU and avoids CUDA initialization. |
 | Parsing | `zerocopy` POD views avoid copies for supported on-disk structures. This does not make the complete I/O-to-validation pipeline zero-copy. |
 | Directories | Directory-entry, connectivity, and link-count checks plus indexed H-Tree root/node validation: depth, count/limit, ordered hashes, child bounds, duplicate references, and leaf structure. Directory index rebalancing is not performed. |
 | Journal | Fail-closed descriptor/tag/commit/revoke parsing into a bounded replay plan, including 64-bit block tags and checksum-v3 data verification. Only committed, non-revoked writes enter the plan. The library application path durably records each pre-image before writing and is interruption-tested; CLI application remains disabled pending broader real-image fixtures. |
@@ -33,9 +33,13 @@ New performance claims must include the fixture-generation command, CPU, RAM, st
 
 ### Latest measured 10 GiB run
 
-On the committed 10 GiB sparse fixture (100,000 generated files, 80 block groups, `/tmp` tmpfs), 10 interleaved warm-cache repetitions measured median wall times of **0.127 s for e2fsck** and **0.374 s for nexfsck**. In this specific run e2fsck was about **2.95× faster**. Both reported 1,182,218 allocated blocks; nexfsck reported zero errors. Nexfsck also completed 30/30 endurance passes with observed peak RSS between 131.61 and 132.48 MiB, followed by successful corruption detection, repair, verification, rollback, and restored-corruption detection.
+On the committed 10 GiB sparse fixture (100,000 generated files, 80 block groups, `/tmp` tmpfs), 10 interleaved warm-cache repetitions measured median wall times of **0.128 s for e2fsck** and **0.119 s for adaptive nexfsck**. In this specific run nexfsck was about **1.08× faster**. Both reported 1,182,220 allocated blocks; nexfsck reported zero errors. Nexfsck also completed 30/30 endurance passes with observed peak RSS between 36.86 and 37.49 MiB, followed by successful corruption detection, repair, verification, rollback, and restored-corruption detection.
+
+The controlled backend matrix measured 0.322 s (`io_uring`+CUDA), 0.124 s (`io_uring`+CPU), 0.314 s (sync+CUDA), 0.117 s (sync+CPU), and 0.118 s (adaptive) medians. Use `--profile` for the phase timing report. CUDA remains available as an explicit diagnostic override; it is not selected merely because a GPU is present.
 
 These are environment-specific selected-counter results, not bit-exact parity or production-storage performance. The fixture was memory-backed and cache was not globally dropped. See the machine-readable [`benchmark-results/latest.json`](benchmark-results/latest.json), raw logs in [`benchmark-results`](benchmark-results), and the reproducible runner [`scripts/stress_benchmark.py`](scripts/stress_benchmark.py).
+
+The fixed-cost diagnosis, ranked phase timings, backend tradeoffs, and CUDA calibration curve are documented in [`docs/performance-profile.md`](docs/performance-profile.md).
 
 ## Workspace architecture
 

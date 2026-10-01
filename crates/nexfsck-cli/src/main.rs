@@ -1,9 +1,11 @@
 //! `nexfsck` — experimental ext4 file system checker
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use std::os::unix::fs::FileTypeExt;
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use nexfsck_compute::{
@@ -13,7 +15,7 @@ use nexfsck_compute::{
     InodeBitmapDiscrepancy, InodeVerificationStats,
 };
 use nexfsck_gpu::{BlockInterval, GpuAccelerator};
-use nexfsck_io::BlockDevice;
+use nexfsck_io::{BlockDevice, IoBackend};
 use nexfsck_journal::AtomicUndoJournal;
 use nexfsck_tui::{LiveMetrics, MetricsServer, ProgressStats};
 
@@ -24,6 +26,70 @@ const FSCK_EXIT_ERRORS_UNCORRECTED: u8 = 4;
 const FSCK_EXIT_OPERATIONAL_ERROR: u8 = 8;
 #[allow(dead_code)]
 const FSCK_EXIT_USAGE_ERROR: u8 = 16;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ComputeChoice {
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum IoChoice {
+    Auto,
+    Uring,
+    Sync,
+}
+
+struct Profile {
+    enabled: bool,
+    process_start: Instant,
+    last: Instant,
+    stages: Vec<(&'static str, Duration)>,
+}
+
+impl Profile {
+    fn new(enabled: bool, process_start: Instant) -> Self {
+        Self {
+            enabled,
+            process_start,
+            last: process_start,
+            stages: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, name: &'static str) {
+        if self.enabled {
+            let now = Instant::now();
+            self.stages.push((name, now.duration_since(self.last)));
+            self.last = now;
+        }
+    }
+
+    fn record(&mut self, name: &'static str, duration: Duration) {
+        if self.enabled {
+            self.stages.push((name, duration));
+        }
+    }
+
+    fn report(&self, backend: &str, io: &str) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!("NEXFSCK_PROFILE_BEGIN backend={backend} io={io}");
+        for (name, duration) in &self.stages {
+            eprintln!(
+                "NEXFSCK_PROFILE stage={name} milliseconds={:.3}",
+                duration.as_secs_f64() * 1000.0
+            );
+        }
+        eprintln!(
+            "NEXFSCK_PROFILE internal_process_ms={:.3}",
+            self.process_start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!("NEXFSCK_PROFILE_END");
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -68,10 +134,25 @@ struct Args {
     /// Expose live Prometheus metrics at /metrics (example: 127.0.0.1:9898)
     #[arg(long = "metrics-listen")]
     metrics_listen: Option<String>,
+
+    /// Print a low-overhead phase timing breakdown to stderr
+    #[arg(long)]
+    profile: bool,
+
+    /// Select extent-collision compute backend
+    #[arg(long = "compute-backend", value_enum, default_value_t = ComputeChoice::Auto)]
+    compute_backend: ComputeChoice,
+
+    /// Select metadata I/O backend
+    #[arg(long = "io-backend", value_enum, default_value_t = IoChoice::Auto)]
+    io_backend: IoChoice,
 }
 
 fn main() -> ExitCode {
+    let process_start = Instant::now();
     let args = Args::parse();
+    let mut profile = Profile::new(args.profile, process_start);
+    profile.mark("cli_config_parsing");
 
     // Initialize tracing
     let filter = if args.verbose { "debug" } else { "info" };
@@ -79,6 +160,7 @@ fn main() -> ExitCode {
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
+    profile.mark("logging_initialization");
 
     if !args.json {
         println!("===============================================================");
@@ -118,7 +200,7 @@ fn main() -> ExitCode {
 
     // 1. Hardware Discovery
     let hw = HardwareProfile::detect();
-    let gpu = GpuAccelerator::probe();
+    profile.mark("hardware_detection");
 
     if !args.json {
         info!(
@@ -132,21 +214,28 @@ fn main() -> ExitCode {
         );
         info!(
             "GPU device: {} [reported memory: {:.1} GB, CUDA compute active: {}]",
-            gpu.device_name(),
-            gpu.vram_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-            gpu.is_available()
+            "deferred until collision workload is known", 0.0, false
         );
     }
 
     // 2. Open Block Device & Flush Cache
     let is_read_only = !args.repair;
-    let dev = match BlockDevice::open(&args.device, is_read_only) {
+    let io_backend = match args.io_backend {
+        IoChoice::Auto => match std::fs::metadata(&args.device) {
+            Ok(metadata) if metadata.file_type().is_block_device() => IoBackend::IoUring,
+            _ => IoBackend::Sync,
+        },
+        IoChoice::Uring => IoBackend::IoUring,
+        IoChoice::Sync => IoBackend::Sync,
+    };
+    let dev = match BlockDevice::open_with_backend(&args.device, is_read_only, io_backend) {
         Ok(d) => d,
         Err(e) => {
             error!("Failed to open device '{}': {}", args.device, e);
             return ExitCode::from(FSCK_EXIT_OPERATIONAL_ERROR);
         }
     };
+    profile.mark("filesystem_open_io_uring_registered_buffers");
     if !args.json {
         info!(
             "Opening target storage: {} (read_only = {})",
@@ -190,6 +279,7 @@ fn main() -> ExitCode {
             }
         }
     };
+    profile.mark("superblock_initialization");
 
     // Multi-Mount Protection (MMP) Check
     if let Ok(Some(mmp)) = dev.read_mmp(&sb) {
@@ -232,6 +322,7 @@ fn main() -> ExitCode {
             return ExitCode::from(FSCK_EXIT_ERRORS_UNCORRECTED);
         }
     };
+    profile.mark("block_group_metadata_reads");
 
     // JBD2 Crash Recovery Journal Inspection
     let mut journal_is_dirty = false;
@@ -252,6 +343,7 @@ fn main() -> ExitCode {
             warn!("Filesystem journal is DIRTY: uncommitted or pending transactions exist.");
         }
     }
+    profile.mark("journal_inspection");
 
     // 5. Initialize In-Memory Roaring Bitmaps & Telemetry
     let tracker = BlockAllocationTracker::new(total_blocks);
@@ -292,6 +384,7 @@ fn main() -> ExitCode {
         tracker.mark_range(desc.inode_bitmap(is_64bit), 1);
         tracker.mark_range(desc.inode_table_block(is_64bit), inode_table_blocks as u32);
     }
+    profile.mark("metadata_tracker_setup");
 
     if !args.json {
         info!("Pass 1: Checking Inode Tables and Extent Trees in parallel...");
@@ -371,13 +464,41 @@ fn main() -> ExitCode {
         stats.record_group(bg_idx, group_bytes, 1, group_had_error);
         live_metrics.update(&stats);
     }
+    profile.mark("inode_table_scanning_extent_tree_parsing");
 
+    // CUDA is deliberately lazy: loading the driver/context before the amount
+    // of collision work is known was the dominant fixed startup cost.
+    let gpu = match args.compute_backend {
+        ComputeChoice::Cpu => GpuAccelerator::cpu_only(),
+        ComputeChoice::Cuda => GpuAccelerator::probe(),
+        // Calibration found no end-to-end CUDA crossover in the tested range.
+        // Auto therefore remains on CPU; CUDA stays explicitly selectable so
+        // future machines/workloads can be recalibrated without hiding work.
+        ComputeChoice::Auto => GpuAccelerator::cpu_only(),
+    };
+    profile.mark("cuda_driver_context_module_initialization");
     let compute_backend = if gpu.is_available() {
         "CUDA PTX + CPU revalidation"
     } else {
         "CPU fallback"
     };
-    let gpu_collisions = gpu.find_interval_collisions(&mut compute_intervals);
+    let (gpu_collisions, collision_profile) =
+        gpu.find_interval_collisions_profiled(&mut compute_intervals);
+    profile.mark("extent_collision_total");
+    profile.record("extent_collision_sort", collision_profile.sort);
+    profile.record(
+        "host_to_gpu_preparation_copy",
+        collision_profile.host_preparation_and_copy,
+    );
+    profile.record("cuda_kernel_launch", collision_profile.kernel_launch);
+    profile.record("gpu_synchronization", collision_profile.gpu_synchronization);
+    profile.record("gpu_copy_back", collision_profile.copy_back);
+    profile.record(
+        "cpu_collision_revalidation",
+        collision_profile.cpu_revalidation,
+    );
+    drop(gpu);
+    profile.mark("cuda_cleanup_shutdown");
     if !args.json {
         info!(
             "Extent collision compute: {} | intervals={} | candidates={}",
@@ -457,6 +578,7 @@ fn main() -> ExitCode {
             }
         }
     }
+    profile.mark("directory_pass");
     let corrupt_dirs = inode_stats.corrupt_directories.load(Ordering::Relaxed);
     if !args.json {
         info!(
@@ -489,6 +611,7 @@ fn main() -> ExitCode {
     inode_stats
         .orphan_directories
         .store(orphan_directories_count, Ordering::Relaxed);
+    profile.mark("connectivity_pass");
     if !args.json {
         info!(
             "Pass 3: Directory connectivity verified (orphan directories: {}).",
@@ -520,6 +643,7 @@ fn main() -> ExitCode {
     inode_stats
         .link_count_mismatches
         .store(link_mismatches_count, Ordering::Relaxed);
+    profile.mark("reference_count_pass");
     if !args.json {
         info!(
             "Pass 4: Inode reference counts validated (mismatches: {}).",
@@ -565,6 +689,7 @@ fn main() -> ExitCode {
             }
         }
     }
+    profile.mark("bitmap_reconciliation");
 
     let corruptions = inode_stats.extent_corruptions.load(Ordering::Relaxed);
     let duplicates = inode_stats.duplicate_blocks.load(Ordering::Relaxed);
@@ -718,6 +843,7 @@ fn main() -> ExitCode {
             );
         }
     }
+    profile.mark("repair_or_read_only_finalization");
 
     // 7. Output Reporting (Text or JSON)
     if args.json {
@@ -843,20 +969,23 @@ fn main() -> ExitCode {
 
         if errors_were_corrected {
             info!("Filesystem errors were successfully corrected. Rollback journal created.");
-            return ExitCode::from(FSCK_EXIT_ERRORS_CORRECTED);
-        }
-
-        if stats.errors_found == 0 {
+        } else if stats.errors_found == 0 {
             info!("Filesystem consistency check completed cleanly with ZERO errors.");
-            return ExitCode::from(FSCK_EXIT_OK);
         } else {
             warn!(
                 "Filesystem consistency check completed with {} inconsistency error(s).",
                 stats.errors_found
             );
-            return ExitCode::from(FSCK_EXIT_ERRORS_UNCORRECTED);
         }
     }
+
+    profile.mark("summary_output_logging");
+    let io_name = if dev.is_io_uring_active() {
+        "io_uring"
+    } else {
+        "sync"
+    };
+    profile.report(compute_backend, io_name);
 
     if errors_were_corrected {
         ExitCode::from(FSCK_EXIT_ERRORS_CORRECTED)

@@ -148,12 +148,12 @@ def generate_frames():
         ("==================================================", (59, 130, 246), False),
         ("INFO Hardware: 16 CPU cores (Rayon active), 31.3 GB RAM", (34, 197, 94), False),
         ("INFO SIMD    : AVX2: true, ARM NEON/CRC: false", (34, 197, 94), False),
-        ("INFO GPU     : CUDA PTX candidates + CPU verification", (168, 85, 247), True),
-        ("INFO I/O     : Linux io_uring (Queue Depth 128) [Active]", (56, 189, 248), True),
+        ("INFO Compute : Adaptive CPU collision path [selected]", (168, 85, 247), True),
+        ("INFO I/O     : Synchronous image-file path [selected]", (56, 189, 248), True),
         ("INFO ext4    : Magic OK | 2,621,440 blocks | 80 groups", (203, 213, 225), False),
         ("INFO Journal : JBD2 Active | Seq: 9 | Clean: true", (203, 213, 225), False),
     ]
-    nexfsck_p1 = ("INFO Pass 1: Inodes & Extent Trees parallel [16T]", (248, 250, 252), False)
+    nexfsck_p1 = ("INFO Pass 1: Inodes & Extent Trees (adaptive granularity)", (248, 250, 252), False)
     nexfsck_p2 = ("INFO Pass 2: Directory Entries & H-Tree (2,412 blks)", (248, 250, 252), False)
     nexfsck_p3 = ("INFO Pass 3: Directory Connectivity (0 orphans)", (248, 250, 252), False)
     nexfsck_p4 = ("INFO Pass 4: Inode Reference Counts (0 mismatch)", (248, 250, 252), False)
@@ -166,7 +166,9 @@ def generate_frames():
         (f"  Directory Entries: {comp['nexfsck_directory_entries']:,} | Errors: 0", (203, 213, 225), False),
         ("--------------------------------------------------", (51, 65, 85), False),
         (f"[OK] CLEAN | 10-run median wall: {comp['nexfsck_median_seconds']:.3f}s", (34, 197, 94), True),
-        (f"[RESULT] e2fsck is {1/comp['median_ratio']:.2f}x faster here", (251, 191, 36), True),
+        ((f"[RESULT] nexfsck is {comp['median_ratio']:.2f}x faster here"
+          if comp['median_ratio'] >= 1 else
+          f"[RESULT] e2fsck is {1/comp['median_ratio']:.2f}x faster here"), (251, 191, 36), True),
     ]
 
     print("Rendering animation frames...")
@@ -187,7 +189,7 @@ def generate_frames():
         draw_window_frame(draw, fonts, 40, 70, 660, 660, "e2fsck v1.46.5", "READ-ONLY • -f -n", (71, 85, 105), is_active=e2_active)
         
         nex_badge_col = (34, 197, 94) if idx >= 18 else (59, 130, 246)
-        nex_badge_txt = "MEASURED RESULT" if idx >= 18 else "CUDA + io_uring active"
+        nex_badge_txt = "MEASURED RESULT" if idx >= 18 else "adaptive CPU + sync"
         draw_window_frame(draw, fonts, 740, 70, 660, 660, "nexfsck v0.1.0", nex_badge_txt, nex_badge_col, is_active=nex_active)
         
         # Build Left lines (e2fsck)

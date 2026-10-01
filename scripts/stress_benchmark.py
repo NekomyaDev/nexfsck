@@ -28,6 +28,13 @@ NEXFSCK_BIN = "/home/pop-os/nexfsck/target/release/nexfsck"
 RESULT_DIR = "/home/pop-os/nexfsck/benchmark-results"
 RESULT_JSON = f"{RESULT_DIR}/latest.json"
 COMPARISON_RUNS = 10
+BACKEND_MODES = {
+    "io_uring_cuda": ["--io-backend", "uring", "--compute-backend", "cuda"],
+    "io_uring_cpu": ["--io-backend", "uring", "--compute-backend", "cpu"],
+    "sync_cuda": ["--io-backend", "sync", "--compute-backend", "cuda"],
+    "sync_cpu": ["--io-backend", "sync", "--compute-backend", "cpu"],
+    "adaptive": [],
+}
 
 def percentile(values, fraction):
     ordered = sorted(values)
@@ -219,6 +226,39 @@ def run_ground_truth_test():
         "nexfsck_errors": nex_errors,
     }
 
+def run_backend_matrix():
+    print("\n" + "=" * 70)
+    print("CONTROLLED BACKEND MATRIX (10 INTERLEAVED WARM-CACHE RUNS)")
+    print("=" * 70)
+    samples = {name: [] for name in BACKEND_MODES}
+    for run in range(1, COMPARISON_RUNS + 1):
+        for name, flags in BACKEND_MODES.items():
+            proc, elapsed = timed_run([NEXFSCK_BIN, "--json", "-n", *flags, IMG_PATH])
+            assert proc.returncode == 0, f"{name} run {run} failed"
+            samples[name].append(elapsed)
+    result = {}
+    for name, values in samples.items():
+        result[name] = {
+            "seconds": values,
+            "median_seconds": statistics.median(values),
+            "p95_seconds": percentile(values, 0.95),
+            "stddev_seconds": statistics.pstdev(values),
+        }
+        print(f"{name:16s} median={result[name]['median_seconds']:.6f}s p95={result[name]['p95_seconds']:.6f}s")
+
+    profile = subprocess.run(
+        [NEXFSCK_BIN, "--json", "--profile", "-n", IMG_PATH],
+        capture_output=True, text=True, check=True,
+    )
+    with open(f"{RESULT_DIR}/profile.stderr.log", "w") as f:
+        f.write(profile.stderr)
+    stages = {}
+    for line in profile.stderr.splitlines():
+        match = re.search(r"stage=(\S+) milliseconds=([0-9.]+)", line)
+        if match:
+            stages[match.group(1)] = float(match.group(2))
+    return {"modes": result, "adaptive_profile_milliseconds": stages}
+
 def run_endurance_stress_test():
     print("\n" + "=" * 70)
     print("STAGE 3: 30-ROUND SUSTAINED ENDURANCE & MEMORY LEAK STRESS TEST (10.0 GiB)")
@@ -388,6 +428,7 @@ def main():
     try:
         populate_filesystem()
         comparison = run_ground_truth_test()
+        backend_matrix = run_backend_matrix()
         endurance = run_endurance_stress_test()
         repair = run_fuzzing_and_repair_test()
         result = {
@@ -413,6 +454,7 @@ def main():
                 "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
             },
             "comparison": comparison,
+            "backend_matrix": backend_matrix,
             "endurance": endurance,
             "repair_rollback": repair,
         }

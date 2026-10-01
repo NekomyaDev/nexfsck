@@ -1,0 +1,27 @@
+NEXFSCK_PROFILE_BEGIN backend=CPU fallback io=sync
+NEXFSCK_PROFILE stage=cli_config_parsing milliseconds=0.062
+NEXFSCK_PROFILE stage=logging_initialization milliseconds=0.031
+NEXFSCK_PROFILE stage=hardware_detection milliseconds=0.087
+NEXFSCK_PROFILE stage=filesystem_open_io_uring_registered_buffers milliseconds=0.007
+NEXFSCK_PROFILE stage=superblock_initialization milliseconds=0.002
+NEXFSCK_PROFILE stage=block_group_metadata_reads milliseconds=0.006
+NEXFSCK_PROFILE stage=journal_inspection milliseconds=2.371
+NEXFSCK_PROFILE stage=metadata_tracker_setup milliseconds=1.368
+NEXFSCK_PROFILE stage=inode_table_scanning_extent_tree_parsing milliseconds=45.561
+NEXFSCK_PROFILE stage=cuda_driver_context_module_initialization milliseconds=0.001
+NEXFSCK_PROFILE stage=extent_collision_total milliseconds=2.030
+NEXFSCK_PROFILE stage=extent_collision_sort milliseconds=1.974
+NEXFSCK_PROFILE stage=host_to_gpu_preparation_copy milliseconds=0.000
+NEXFSCK_PROFILE stage=cuda_kernel_launch milliseconds=0.000
+NEXFSCK_PROFILE stage=gpu_synchronization milliseconds=0.000
+NEXFSCK_PROFILE stage=gpu_copy_back milliseconds=0.000
+NEXFSCK_PROFILE stage=cpu_collision_revalidation milliseconds=0.000
+NEXFSCK_PROFILE stage=cuda_cleanup_shutdown milliseconds=0.000
+NEXFSCK_PROFILE stage=directory_pass milliseconds=25.881
+NEXFSCK_PROFILE stage=connectivity_pass milliseconds=1.119
+NEXFSCK_PROFILE stage=reference_count_pass milliseconds=3.185
+NEXFSCK_PROFILE stage=bitmap_reconciliation milliseconds=31.907
+NEXFSCK_PROFILE stage=repair_or_read_only_finalization milliseconds=0.000
+NEXFSCK_PROFILE stage=summary_output_logging milliseconds=0.030
+NEXFSCK_PROFILE internal_process_ms=113.725
+NEXFSCK_PROFILE_END

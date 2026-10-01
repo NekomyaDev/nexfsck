@@ -47,18 +47,36 @@ pub struct BlockDevice {
     media_errors: AtomicU64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoBackend {
+    Auto,
+    IoUring,
+    Sync,
+}
+
 impl BlockDevice {
     /// Opens the specified block device or disk image.
     /// Executes mandatory cache flush (`ioctl BLKFLSBUF`) to avoid reading stale cache lines.
     /// Initializes an asynchronous Linux `io_uring` engine if supported by the kernel and environment.
     pub fn open<P: AsRef<Path>>(path: P, read_only: bool) -> Result<Self, IoError> {
+        Self::open_with_backend(path, read_only, IoBackend::Auto)
+    }
+
+    pub fn open_with_backend<P: AsRef<Path>>(
+        path: P,
+        read_only: bool,
+        backend: IoBackend,
+    ) -> Result<Self, IoError> {
         let path_str = path.as_ref().to_string_lossy().to_string();
         let file = OpenOptions::new()
             .read(true)
             .write(!read_only)
             .open(&path)?;
 
-        let uring = IoUringEngine::try_new(file.as_raw_fd(), 128);
+        let uring = match backend {
+            IoBackend::Sync => None,
+            IoBackend::Auto | IoBackend::IoUring => IoUringEngine::try_new(file.as_raw_fd(), 128),
+        };
 
         let dev = Self {
             file,

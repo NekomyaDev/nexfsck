@@ -152,13 +152,14 @@ impl CudaContext {
         }
     }
 
-    pub fn find_collision_candidates(
+    pub fn find_collision_candidates_profiled(
         &self,
         intervals: &[BlockInterval],
-    ) -> Result<Vec<usize>, String> {
+    ) -> Result<(Vec<usize>, [std::time::Duration; 4]), String> {
         if intervals.len() < 2 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), [std::time::Duration::ZERO; 4]));
         }
+        let started = std::time::Instant::now();
         let starts: Vec<u64> = intervals.iter().map(|v| v.start_block).collect();
         let counts: Vec<u32> = intervals.iter().map(|v| v.block_count).collect();
         let mut flags = vec![0u8; intervals.len()];
@@ -170,6 +171,7 @@ impl CudaContext {
                 (self.mem_alloc)(&mut flags_d, flags.len()),
                 "cuMemAlloc(flags)",
             )?;
+            let preparation = started.elapsed();
             let mut starts_arg = starts_d;
             let mut counts_arg = counts_d;
             let mut flags_arg = flags_d;
@@ -181,7 +183,8 @@ impl CudaContext {
                 (&mut count_arg as *mut u32).cast(),
             ];
             let blocks = (intervals.len() as u32).div_ceil(256);
-            let result = check(
+            let launched = std::time::Instant::now();
+            let launch_result = check(
                 (self.launch)(
                     self.function,
                     blocks,
@@ -196,24 +199,31 @@ impl CudaContext {
                     ptr::null_mut(),
                 ),
                 "cuLaunchKernel",
-            )
-            .and_then(|_| check((self.synchronize)(), "cuCtxSynchronize"))
-            .and_then(|_| {
+            );
+            let launch = launched.elapsed();
+            let syncing = std::time::Instant::now();
+            let sync_result =
+                launch_result.and_then(|_| check((self.synchronize)(), "cuCtxSynchronize"));
+            let synchronization = syncing.elapsed();
+            let copying = std::time::Instant::now();
+            let result = sync_result.and_then(|_| {
                 check(
                     (self.copy_to_host)(flags.as_mut_ptr().cast(), flags_d, flags.len()),
                     "cuMemcpyDtoH",
                 )
             });
+            let copy_back = copying.elapsed();
             (self.mem_free)(starts_d);
             (self.mem_free)(counts_d);
             (self.mem_free)(flags_d);
             result?;
+            let indices = flags
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, flag)| (flag != 0).then_some(i))
+                .collect();
+            Ok((indices, [preparation, launch, synchronization, copy_back]))
         }
-        Ok(flags
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, flag)| (flag != 0).then_some(i))
-            .collect())
     }
 
     unsafe fn allocate_copy<T>(&self, values: &[T]) -> Result<CuDevicePtr, String> {
