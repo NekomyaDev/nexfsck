@@ -31,16 +31,19 @@ The historical 1 GiB `0.28 s` versus `0.02 s` result and its `14x`, RTX 4060, an
 
 New performance claims must include the fixture-generation command, CPU, RAM, storage, kernel, tool versions and flags, cache policy, thread count, active I/O backend, sample count, and variance. GPU acceleration may only be claimed when a compute backend exists and the benchmark records that it executed. See [`docs/benchmarking.md`](docs/benchmarking.md).
 
-### Latest measured 10 GiB run
+### Benchmark video
 
-On the committed 10 GiB sparse fixture (100,000 generated files, 80 block groups, `/tmp` tmpfs), 10 interleaved warm-cache repetitions measured median wall times of **0.1250 s for e2fsck** and **0.0534 s for adaptive nexfsck** (p95 0.1296 s and 0.0631 s; population standard deviations 0.00212 s and 0.00296 s). Both reported 1,182,237 allocated blocks; e2fsck reported 112,308 total inodes and nexfsck 112,301 active inodes (the seven reserved inodes account for the difference). Nexfsck reported zero errors. It completed 30/30 endurance passes with peak RSS between 36.36 and 36.61 MiB, followed by successful corruption detection, repair, verification, rollback, and restored-corruption detection.
+<p align="center">
+  <a href="assets/benchmark_live.mp4">
+    <img src="assets/benchmark_live.gif" alt="Nexfsck 10 GiB benchmark run" width="100%">
+  </a>
+</p>
 
-The controlled backend matrix measured 0.2535 s (`io_uring`+CUDA), 0.0577 s (`io_uring`+CPU), 0.2457 s (sync+CUDA), 0.0532 s (sync+CPU), and 0.0529 s (adaptive) medians. This 10 GiB fixture's profile attributed about 6.37 ms to inode CRC32c checks, 0.97 ms to directory checksums, 2.48 ms to journal inspection, and 29.41 ms to the inode/extent stage. CUDA remains available as an explicit diagnostic override; it is not selected merely because a GPU is present.
+Click the preview to open the [MP4 video](assets/benchmark_live.mp4). Full measurements, raw logs, and exact source provenance are in [`benchmark-results/latest.json`](benchmark-results/latest.json); the reproducible runner is [`scripts/stress_benchmark.py`](scripts/stress_benchmark.py). These tmpfs warm-cache results are environment-specific, not bit-exact parity or production-storage performance.
 
-These are environment-specific selected-counter results, not bit-exact parity or production-storage performance. The fixture was memory-backed and cache was not globally dropped. See the machine-readable [`benchmark-results/latest.json`](benchmark-results/latest.json), raw logs in [`benchmark-results`](benchmark-results), and the reproducible runner [`scripts/stress_benchmark.py`](scripts/stress_benchmark.py).
+### Integrity coverage
 
-The metadata checksum coverage and ext4 feature compatibility matrix are in [`docs/ext4-integrity-coverage.md`](docs/ext4-integrity-coverage.md). Implemented checksum validation covers superblocks, group descriptors, allocation bitmaps, inodes, directories/HTrees, and external extent-tree blocks. MMP, xattr, JBD2 full-metadata, and other listed gaps remain explicitly partial or rejected; filesystems carrying features nexfsck cannot safely validate are rejected. The latest benchmark source is `528f4321ec67efa1770ef7f279d9f103b7bab525`; see the raw sample arrays and publication commit resolver in `benchmark-results/latest.json`.
-The allocation, bitmap, directory, thread-scaling, and additional-workload results are documented in [`docs/hot-path-optimization.md`](docs/hot-path-optimization.md).
+The metadata checksum coverage and ext4 feature compatibility matrix are in [`docs/ext4-integrity-coverage.md`](docs/ext4-integrity-coverage.md). Implemented checksum validation covers superblocks, group descriptors, allocation bitmaps, inodes, directories/HTrees, and external extent-tree blocks. MMP, xattr, JBD2 full-metadata, and other listed gaps remain explicitly partial or rejected; filesystems carrying features nexfsck cannot safely validate are rejected. Allocation, bitmap, directory, thread-scaling, and additional-workload results are documented in [`docs/hot-path-optimization.md`](docs/hot-path-optimization.md).
 
 ## Workspace architecture
 
