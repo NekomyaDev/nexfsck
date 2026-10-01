@@ -96,6 +96,15 @@ performed once per inode checksum chain. A fused checksum/decode timer was not
 retained because it would obscure the independently measured correctness cost;
 the existing two linear table passes remain a documented optimization target.
 
+Fusion was experimentally compared on a clean 128 MiB, 4 KiB-block, indexed
+ext4 image with 900 generated files. Twenty interleaved warm-cache repetitions
+per mode measured separate checksum/decode at 21.553 ms median (23.726 ms p95,
+1.014 ms sample standard deviation), versus fused at 21.676 ms (22.851 ms p95,
+0.821 ms standard deviation). The 0.123 ms median regression is within run
+variance and the fused instrumentation had less reliable attribution, so the
+separate-pass implementation was retained. This is a negative experiment, not
+evidence that fusion can never help larger fixtures.
+
 The final comparison measured e2fsck at 0.127931 s and adaptive nexfsck at
 0.118554 s median (1.08x for nexfsck on this fixture only). Allocated blocks
 matched at 1,182,220 and nexfsck reported zero errors. All 30 endurance passes,

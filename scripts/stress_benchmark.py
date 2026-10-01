@@ -335,8 +335,14 @@ def run_fuzzing_and_repair_test():
     print("STAGE 4: MULTI-GROUP CORRUPTION, PRE-IMAGE UNDO JOURNAL & ROLLBACK (10.0 GiB)")
     print("=" * 70)
     
-    # Never mutate the clean benchmark fixture.
-    subprocess.check_call(["cp", "--sparse=always", IMG_PATH, CORRUPT_IMG])
+    # Keep the correctness/performance fixture checksum-enabled and immutable.
+    # Bitmap repair tests use a separate legacy-checksum image because nexfsck
+    # intentionally refuses to recalculate metadata_csum after an untrusted
+    # bitmap payload mismatch.
+    if os.path.exists(CORRUPT_IMG):
+        os.remove(CORRUPT_IMG)
+    subprocess.check_call(["truncate", "-s", "10G", CORRUPT_IMG])
+    subprocess.check_call(["mkfs.ext4", "-q", "-F", "-b", "4096", "-O", "64bit,dir_index,extents,^metadata_csum", CORRUPT_IMG])
     block_groups_info = subprocess.check_output(["dumpe2fs", CORRUPT_IMG], stderr=subprocess.DEVNULL).decode()
     
     bm_blocks = []
@@ -429,6 +435,7 @@ def run_fuzzing_and_repair_test():
     if os.path.exists(UNDO_LOG):
         os.remove(UNDO_LOG)
     return {
+        "repair_fixture_features": "64bit,dir_index,extents; metadata_csum disabled for supported bitmap-repair exercise",
         "block_bitmap_group": 0,
         "inode_bitmap_group": target_bg,
         "detection_exit": pA.returncode,

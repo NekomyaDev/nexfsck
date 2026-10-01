@@ -59,8 +59,11 @@ pub const EXT4_FEATURE_RO_COMPAT_HUGE_FILE: u32 = 0x0008;
 pub const EXT4_FEATURE_RO_COMPAT_GDT_CSUM: u32 = 0x0010;
 pub const EXT4_FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0020;
 pub const EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
-pub const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER2: u32 = 0x0200;
 pub const EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
+pub const EXT4_FEATURE_RO_COMPAT_QUOTA: u32 = 0x0100;
+pub const EXT4_FEATURE_RO_COMPAT_BIGALLOC: u32 = 0x0200;
+pub const EXT4_FEATURE_RO_COMPAT_PROJECT: u32 = 0x2000;
+pub const EXT4_FEATURE_RO_COMPAT_VERITY: u32 = 0x8000;
 
 pub const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 pub const EXT4_FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
@@ -71,6 +74,16 @@ pub const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
 pub const EXT4_FEATURE_INCOMPAT_MMP: u32 = 0x0100;
 pub const EXT4_FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0200;
 pub const EXT4_FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
+pub const EXT4_FEATURE_INCOMPAT_EA_INODE: u32 = 0x0400;
+pub const EXT4_FEATURE_INCOMPAT_LARGEDIR: u32 = 0x4000;
+pub const EXT4_FEATURE_INCOMPAT_INLINE_DATA: u32 = 0x8000;
+pub const EXT4_FEATURE_INCOMPAT_ENCRYPT: u32 = 0x10000;
+pub const EXT4_FEATURE_INCOMPAT_CASEFOLD: u32 = 0x20000;
+
+pub const EXT4_FEATURE_COMPAT_ORPHAN_FILE: u32 = 0x1000;
+pub const EXT4_FEATURE_COMPAT_SPARSE_SUPER2: u32 = 0x0200;
+pub const EXT4_BG_BLOCK_BITMAP_CSUM_HI_END: usize = 58;
+pub const EXT4_BG_INODE_BITMAP_CSUM_HI_END: usize = 60;
 
 // Directory file types
 pub const EXT4_FT_UNKNOWN: u8 = 0;
@@ -247,6 +260,10 @@ impl Ext4Superblock {
         (u32::from_le(self.s_feature_incompat) & feature) != 0
     }
 
+    pub fn has_compat_feature(&self, feature: u32) -> bool {
+        (u32::from_le(self.s_feature_compat) & feature) != 0
+    }
+
     pub fn has_ro_compat_feature(&self, feature: u32) -> bool {
         (u32::from_le(self.s_feature_ro_compat) & feature) != 0
     }
@@ -298,7 +315,7 @@ impl Ext4Superblock {
         if bg == 0 {
             return true;
         }
-        if self.has_ro_compat_feature(EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER2) {
+        if self.has_compat_feature(EXT4_FEATURE_COMPAT_SPARSE_SUPER2) {
             let b1 = u32::from_le(self.s_backup_bgs[0]) as u64;
             let b2 = u32::from_le(self.s_backup_bgs[1]) as u64;
             return (b1 != 0 && bg == b1) || (b2 != 0 && bg == b2);

@@ -56,12 +56,323 @@ fn flip_image_byte(image: &Path, byte_offset: u64) {
     file.sync_all().unwrap();
 }
 
+fn make_metadata_csum_image(path: &Path) {
+    assert!(Command::new("truncate")
+        .args(["-s", "64M", path.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-O", "metadata_csum", path.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+}
+
+fn ext4_layout(image: &Path) -> (u64, u64, u64, u64, u64) {
+    let header = Command::new("dumpe2fs")
+        .args(["-h", image.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let header = String::from_utf8_lossy(&header.stdout);
+    let block_size = header
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Block size:")
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap();
+    let groups = Command::new("dumpe2fs")
+        .args(["-g", image.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let groups = String::from_utf8_lossy(&groups.stdout);
+    let fields: Vec<_> = groups
+        .lines()
+        .find(|line| line.starts_with("0:"))
+        .unwrap()
+        .split(':')
+        .collect();
+    let first_data = if block_size == 1024 { 1 } else { 0 };
+    let descriptor_table = (first_data + 1) * block_size;
+    let descriptor = fields[3].split('-').next().unwrap().parse::<u64>().unwrap();
+    let block_bitmap = fields[4].parse::<u64>().unwrap() * block_size;
+    let inode_bitmap = fields[5].parse::<u64>().unwrap() * block_size;
+    (
+        block_size,
+        descriptor_table,
+        block_bitmap,
+        inode_bitmap,
+        descriptor,
+    )
+}
+
+#[test]
+fn test_metadata_checksum_corruption_oracle() {
+    let clean = unique_test_path("metadata-csum-clean.img");
+    make_metadata_csum_image(&clean);
+    let (_block_size, descriptor_table, block_bitmap, inode_bitmap, _) = ext4_layout(&clean);
+    let (clean_code, clean_json) = run_nexfsck_json(&clean);
+    assert_eq!(clean_code, 0, "{clean_json}");
+    assert!(Command::new("e2fsck")
+        .args(["-f", "-n", clean.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+
+    let corruptions = [
+        (
+            "superblock",
+            1024 + 1020,
+            "\"superblock_checksum_failures\":1",
+        ),
+        (
+            "group-payload",
+            descriptor_table,
+            "\"group_descriptor_checksum_failures\":1",
+        ),
+        (
+            "group-checksum",
+            descriptor_table + 30,
+            "\"group_descriptor_checksum_failures\":1",
+        ),
+        (
+            "block-bitmap",
+            block_bitmap,
+            "\"block_bitmap_checksum_failures\": 1",
+        ),
+        (
+            "block-bitmap-csum",
+            descriptor_table + 24,
+            "\"group_descriptor_checksum_failures\":1",
+        ),
+        (
+            "inode-bitmap",
+            inode_bitmap,
+            "\"inode_bitmap_checksum_failures\": 1",
+        ),
+        (
+            "inode-bitmap-csum",
+            descriptor_table + 26,
+            "\"group_descriptor_checksum_failures\":1",
+        ),
+    ];
+    for (label, offset, counter) in corruptions {
+        let corrupt = unique_test_path(&format!("metadata-csum-{label}.img"));
+        std::fs::copy(&clean, &corrupt).unwrap();
+        flip_image_byte(&corrupt, offset);
+        let (code, stdout) = run_nexfsck_json(&corrupt);
+        assert_eq!(code, 4, "{label}: {stdout}");
+        if !counter.is_empty() {
+            assert!(stdout.contains(counter), "{label}: {stdout}");
+        }
+        let e2fsck = Command::new("e2fsck")
+            .args(["-f", "-n", corrupt.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let e2fsck_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&e2fsck.stdout),
+            String::from_utf8_lossy(&e2fsck.stderr)
+        );
+        assert!(
+            e2fsck.status.code() != Some(0) || e2fsck_text.to_lowercase().contains("checksum"),
+            "e2fsck gave no checksum diagnostic for {label}: {e2fsck_text}"
+        );
+        std::fs::remove_file(corrupt).unwrap();
+    }
+    std::fs::remove_file(clean).unwrap();
+}
+
+#[test]
+fn test_directory_checksum_corruption_oracle() {
+    let clean = unique_test_path("dir-csum-clean.img");
+    make_metadata_csum_image(&clean);
+    let (block_size, _, _, _, _) = ext4_layout(&clean);
+    let blocks = Command::new("debugfs")
+        .args(["-R", "blocks <2>", clean.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let blocks_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&blocks.stdout),
+        String::from_utf8_lossy(&blocks.stderr)
+    );
+    let block = blocks_text
+        .split_whitespace()
+        .filter_map(|part| part.parse::<u64>().ok())
+        .next()
+        .expect("root directory block");
+    let (code, stdout) = run_nexfsck_json(&clean);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(Command::new("e2fsck")
+        .args(["-f", "-n", clean.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+
+    let corrupt = unique_test_path("dir-csum-corrupt.img");
+    std::fs::copy(&clean, &corrupt).unwrap();
+    flip_image_byte(&corrupt, block * block_size + block_size - 1);
+    let (code, stdout) = run_nexfsck_json(&corrupt);
+    assert_eq!(code, 4, "{stdout}");
+    assert!(
+        stdout.contains("\"directory_checksum_failures\": 1"),
+        "{stdout}"
+    );
+    let e2fsck = Command::new("e2fsck")
+        .args(["-f", "-n", corrupt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&e2fsck.stdout),
+        String::from_utf8_lossy(&e2fsck.stderr)
+    );
+    assert!(
+        text.to_lowercase().contains("checksum") || e2fsck.status.code() != Some(0),
+        "{text}"
+    );
+    std::fs::remove_file(corrupt).unwrap();
+    std::fs::remove_file(clean).unwrap();
+}
+
+#[test]
+fn test_htree_checksum_corruption_oracle() {
+    let source = unique_test_path("htree-source");
+    std::fs::create_dir(&source).unwrap();
+    for index in 0..900u32 {
+        std::fs::write(source.join(format!("entry-{index:04}")), b"x").unwrap();
+    }
+    let image = unique_test_path("htree-csum.img");
+    assert!(Command::new("truncate")
+        .args(["-s", "128M", image.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-O",
+            "metadata_csum,dir_index",
+            "-d",
+            source.to_str().unwrap(),
+            image.to_str().unwrap()
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let indexed = Command::new("e2fsck")
+        .args(["-f", "-y", "-D", image.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(
+        matches!(indexed.code(), Some(0) | Some(1)),
+        "e2fsck -D failed: {indexed}"
+    );
+    let stat = Command::new("debugfs")
+        .args(["-R", "stat <2>", image.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stat_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stat.stdout),
+        String::from_utf8_lossy(&stat.stderr)
+    );
+    let inode_flags = stat_text
+        .lines()
+        .find_map(|line| {
+            line.split("Flags: 0x")
+                .nth(1)
+                .and_then(|value| u32::from_str_radix(value.split_whitespace().next()?, 16).ok())
+        })
+        .unwrap_or(0);
+    assert_ne!(
+        inode_flags & 0x1000,
+        0,
+        "fixture root directory was not indexed: {stat_text}"
+    );
+    let blocks = Command::new("debugfs")
+        .args(["-R", "blocks <2>", image.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let blocks_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&blocks.stdout),
+        String::from_utf8_lossy(&blocks.stderr)
+    );
+    let block = blocks_text
+        .split_whitespace()
+        .filter_map(|part| part.parse::<u64>().ok())
+        .nth(1)
+        .unwrap();
+    let (block_size, _, _, _, _) = ext4_layout(&image);
+    let (code, stdout) = run_nexfsck_json(&image);
+    assert_eq!(code, 0, "{stdout}");
+
+    let corrupt = unique_test_path("htree-csum-corrupt.img");
+    std::fs::copy(&image, &corrupt).unwrap();
+    flip_image_byte(&corrupt, block * block_size + block_size - 1);
+    let (code, stdout) = run_nexfsck_json(&corrupt);
+    assert_eq!(code, 4, "{stdout}");
+    assert!(
+        stdout.contains("\"directory_checksum_failures\": 1"),
+        "{stdout}"
+    );
+    let e2fsck = Command::new("e2fsck")
+        .args(["-f", "-n", corrupt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&e2fsck.stdout),
+        String::from_utf8_lossy(&e2fsck.stderr)
+    );
+    assert!(
+        diagnostic.to_lowercase().contains("checksum") || e2fsck.status.code() != Some(0),
+        "{diagnostic}"
+    );
+    std::fs::remove_file(corrupt).unwrap();
+    std::fs::remove_file(image).unwrap();
+    std::fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
+fn test_unsupported_feature_fails_closed() {
+    let image = unique_test_path("unsupported-inline-data.img");
+    assert!(Command::new("truncate")
+        .args(["-s", "64M", image.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-O", "inline_data", image.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let output = Command::new(env!("CARGO_BIN_EXE_nexfsck"))
+        .args(["--json", "-n", image.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(diagnostic.contains("inline_data"), "{diagnostic}");
+    std::fs::remove_file(image).unwrap();
+}
+
 #[test]
 fn test_real_ext4_inode_checksum_clean_layouts_and_seed_modes() {
     for (label, inode_size, features) in [
         ("inode-csum-128", "128", "metadata_csum"),
         ("inode-csum-256", "256", "metadata_csum"),
         ("inode-csum-seed", "256", "metadata_csum,metadata_csum_seed"),
+        ("metadata-csum-desc32", "256", "metadata_csum,^64bit"),
+        ("legacy-gdt-csum", "256", "uninit_bg,^metadata_csum"),
     ] {
         let image = unique_test_path(&format!("{label}.img"));
         assert!(Command::new("truncate")
@@ -336,7 +647,9 @@ fn test_active_repair_false_free_block() {
     let _ = Command::new("truncate")
         .args(["-s", "32M", img_path])
         .status();
-    let _ = Command::new("mkfs.ext4").args(["-F", img_path]).status();
+    let _ = Command::new("mkfs.ext4")
+        .args(["-F", "-O", "^metadata_csum", img_path])
+        .status();
 
     // 2. Artificially clear a bit in block bitmap (block 5 is block bitmap in group 0)
     // Clear bit 0 of block 0 (superblock) so it becomes a false-free block
@@ -395,7 +708,9 @@ fn test_active_repair_false_free_inode() {
     let _ = Command::new("truncate")
         .args(["-s", "32M", img_path])
         .status();
-    let _ = Command::new("mkfs.ext4").args(["-F", img_path]).status();
+    let _ = Command::new("mkfs.ext4")
+        .args(["-F", "-O", "^metadata_csum", img_path])
+        .status();
 
     // 2. Artificially clear bit 1 (inode 2) in inode bitmap (block 21 in 32M ext4)
     let mut file = OpenOptions::new()

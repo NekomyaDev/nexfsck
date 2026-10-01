@@ -10,11 +10,220 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use zerocopy::FromBytes;
+use zerocopy::IntoBytes;
 
 use nexfsck_core::{
-    Ext4DirEntry2Header, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, Ext4Inode, Ext4Superblock,
-    EXT4_FEATURE_INCOMPAT_CSUM_SEED, EXT4_FEATURE_RO_COMPAT_METADATA_CSUM, EXT4_FT_DIR_CSUM,
+    Ext4DirEntry2Header, Ext4Extent, Ext4ExtentHeader, Ext4ExtentIdx, Ext4GroupDesc, Ext4Inode,
+    Ext4Superblock, EXT4_FEATURE_INCOMPAT_CSUM_SEED, EXT4_FEATURE_RO_COMPAT_METADATA_CSUM,
+    EXT4_FT_DIR_CSUM,
 };
+
+const EXT4_SUPERBLOCK_CSUM_OFFSET: usize = 1020;
+const EXT4_GROUP_DESC_CSUM_OFFSET: usize = 30;
+
+/// Common filesystem checksum state. Each verifier below follows the ext4
+/// structure-specific byte coverage rules; this type only shares the seed.
+#[derive(Debug, Clone, Copy)]
+pub struct Ext4MetadataChecksum {
+    enabled: bool,
+    crc32c_supported: bool,
+    gdt_crc16: bool,
+    seed: u32,
+    uuid: [u8; 16],
+}
+
+impl Ext4MetadataChecksum {
+    pub fn new(sb: &Ext4Superblock) -> Self {
+        let enabled = sb.has_ro_compat_feature(EXT4_FEATURE_RO_COMPAT_METADATA_CSUM);
+        let seed = if sb.has_incompat_feature(EXT4_FEATURE_INCOMPAT_CSUM_SEED) {
+            u32::from_le(sb.s_checksum_seed)
+        } else {
+            ext4_crc32c(u32::MAX, &sb.s_uuid)
+        };
+        Self {
+            enabled,
+            crc32c_supported: u8::from_le(sb.s_checksum_type) == 1,
+            gdt_crc16: sb.has_ro_compat_feature(nexfsck_core::EXT4_FEATURE_RO_COMPAT_GDT_CSUM),
+            seed,
+            uuid: sb.s_uuid,
+        }
+    }
+
+    pub fn verify_superblock(&self, raw_superblock: &[u8]) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        if !self.crc32c_supported {
+            return false;
+        }
+        if raw_superblock.len() < nexfsck_core::EXT4_SUPERBLOCK_SIZE {
+            return false;
+        }
+        let raw = &raw_superblock[..nexfsck_core::EXT4_SUPERBLOCK_SIZE];
+        let expected =
+            u32::from_le_bytes(raw[EXT4_SUPERBLOCK_CSUM_OFFSET..1024].try_into().unwrap());
+        ext4_crc32c(u32::MAX, &raw[..EXT4_SUPERBLOCK_CSUM_OFFSET]) == expected
+    }
+
+    pub fn verify_group_descriptor(&self, group: u32, descriptor: &[u8]) -> bool {
+        if !self.enabled && !self.gdt_crc16 {
+            return true;
+        }
+        if self.enabled && !self.crc32c_supported {
+            return false;
+        }
+        if descriptor.len() < 32 || EXT4_GROUP_DESC_CSUM_OFFSET + 2 > descriptor.len() {
+            return false;
+        }
+        let provided = u16::from_le_bytes(descriptor[30..32].try_into().unwrap());
+        let mut bytes = descriptor.to_vec();
+        bytes[30..32].fill(0);
+        if self.enabled {
+            let mut crc = ext4_crc32c(self.seed, &group.to_le_bytes());
+            crc = ext4_crc32c(crc, &bytes);
+            provided == crc as u16
+        } else {
+            let mut crc = crc16_ext4(0xffff, &self.uuid);
+            crc = crc16_ext4(crc, &group.to_le_bytes());
+            crc = crc16_ext4(crc, &bytes[..EXT4_GROUP_DESC_CSUM_OFFSET]);
+            crc = crc16_ext4(crc, &bytes[EXT4_GROUP_DESC_CSUM_OFFSET + 2..]);
+            provided == crc
+        }
+    }
+
+    pub fn verify_group_desc(
+        &self,
+        group: u32,
+        descriptor: &Ext4GroupDesc,
+        descriptor_size: usize,
+    ) -> bool {
+        self.verify_group_descriptor(group, &descriptor.as_bytes()[..descriptor_size.min(64)])
+    }
+
+    pub fn verify_block_bitmap(
+        &self,
+        group: u32,
+        bitmap: &[u8],
+        desc: &Ext4GroupDesc,
+        descriptor_size: usize,
+    ) -> bool {
+        let has_high = descriptor_size >= nexfsck_core::EXT4_BG_BLOCK_BITMAP_CSUM_HI_END;
+        let mut provided = u16::from_le(desc.bg_block_bitmap_csum_lo) as u32;
+        if has_high {
+            provided |= (u16::from_le(desc.bg_block_bitmap_csum_hi) as u32) << 16;
+        }
+        self.verify_bitmap(group, bitmap, provided, has_high)
+    }
+
+    pub fn verify_inode_bitmap(
+        &self,
+        group: u32,
+        bitmap: &[u8],
+        desc: &Ext4GroupDesc,
+        descriptor_size: usize,
+    ) -> bool {
+        let has_high = descriptor_size >= nexfsck_core::EXT4_BG_INODE_BITMAP_CSUM_HI_END;
+        let mut provided = u16::from_le(desc.bg_inode_bitmap_csum_lo) as u32;
+        if has_high {
+            provided |= (u16::from_le(desc.bg_inode_bitmap_csum_hi) as u32) << 16;
+        }
+        self.verify_bitmap(group, bitmap, provided, has_high)
+    }
+
+    pub fn verify_directory_block(
+        &self,
+        inode: u32,
+        generation: u32,
+        block: &[u8],
+        htree_root: bool,
+    ) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        if !self.crc32c_supported {
+            return false;
+        }
+        if block.len() < 12 {
+            return false;
+        }
+        if htree_root
+            || (u32::from_le_bytes(block[0..4].try_into().unwrap()) == 0
+                && u16::from_le_bytes(block[4..6].try_into().unwrap()) as usize == block.len())
+        {
+            let count_offset = if htree_root { 32 } else { 8 };
+            if count_offset + 4 > block.len() {
+                return false;
+            }
+            let limit =
+                u16::from_le_bytes(block[count_offset..count_offset + 2].try_into().unwrap())
+                    as usize;
+            let count = u16::from_le_bytes(
+                block[count_offset + 2..count_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let tail_offset = count_offset.saturating_add(limit.saturating_mul(8));
+            let used_end = count_offset.saturating_add(count.saturating_mul(8));
+            if count == 0
+                || count > limit
+                || tail_offset + 8 > block.len()
+                || used_end > tail_offset
+            {
+                return false;
+            }
+            let provided =
+                u32::from_le_bytes(block[tail_offset + 4..tail_offset + 8].try_into().unwrap());
+            let mut crc = ext4_crc32c(self.seed, &inode.to_le_bytes());
+            crc = ext4_crc32c(crc, &generation.to_le_bytes());
+            crc = ext4_crc32c(crc, &block[..used_end]);
+            crc = ext4_crc32c(crc, &block[tail_offset..tail_offset + 4]);
+            crc = ext4_crc32c(crc, &[0; 4]);
+            return provided == crc;
+        }
+        let tail = block.len() - 12;
+        if u32::from_le_bytes(block[tail..tail + 4].try_into().unwrap()) != 0
+            || u16::from_le_bytes(block[tail + 4..tail + 6].try_into().unwrap()) as usize != 12
+            || block[tail + 6] != 0
+            || block[tail + 7] != EXT4_FT_DIR_CSUM
+        {
+            return false;
+        }
+        let provided = u32::from_le_bytes(block[tail + 8..tail + 12].try_into().unwrap());
+        let mut crc = ext4_crc32c(self.seed, &inode.to_le_bytes());
+        crc = ext4_crc32c(crc, &generation.to_le_bytes());
+        crc = ext4_crc32c(crc, &block[..tail]);
+        provided == crc
+    }
+
+    pub fn verify_bitmap(&self, _group: u32, bitmap: &[u8], provided: u32, has_high: bool) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        if !self.crc32c_supported {
+            return false;
+        }
+        let crc = ext4_crc32c(self.seed, bitmap);
+        if has_high {
+            provided == crc
+        } else {
+            provided == (crc & 0xffff)
+        }
+    }
+}
+
+fn crc16_ext4(mut crc: u16, bytes: &[u8]) -> u16 {
+    for &byte in bytes {
+        crc ^= byte as u16;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xa001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
 
 const INODE_GENERATION_OFFSET: usize = 100;
 const INODE_CHECKSUM_LO_OFFSET: usize = 124;
@@ -455,6 +664,10 @@ mod crc_tests {
 /// Statistics collected during inode & extent verification.
 #[derive(Debug, Default)]
 pub struct InodeVerificationStats {
+    pub superblock_checksum_failures: AtomicU64,
+    pub group_descriptor_checksum_failures: AtomicU64,
+    pub block_bitmap_checksum_failures: AtomicU64,
+    pub inode_bitmap_checksum_failures: AtomicU64,
     pub total_inodes_scanned: AtomicU64,
     pub used_inodes: AtomicU64,
     pub directory_inodes: AtomicU64,
@@ -470,6 +683,8 @@ pub struct InodeVerificationStats {
     pub orphan_directories: AtomicU64,
     pub link_count_mismatches: AtomicU64,
     pub inode_checksum_failures: AtomicU64,
+    pub directory_checksum_failures: AtomicU64,
+    pub extent_block_checksum_failures: AtomicU64,
 }
 
 impl InodeVerificationStats {

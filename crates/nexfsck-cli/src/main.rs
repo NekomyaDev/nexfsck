@@ -7,12 +7,14 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+use zerocopy::IntoBytes;
 
 use nexfsck_compute::{
     collect_directory_blocks, collect_inode_extents, reconcile_block_bitmap,
     reconcile_inode_bitmap, verify_directory_block_compact, verify_htree_directory,
-    verify_inodes_parallel, BitmapDiscrepancy, BlockAllocationTracker, HardwareProfile,
-    InodeBitmapDiscrepancy, InodeChecksumResult, InodeChecksumVerifier, InodeVerificationStats,
+    verify_inodes_parallel, BitmapDiscrepancy, BlockAllocationTracker, Ext4MetadataChecksum,
+    HardwareProfile, InodeBitmapDiscrepancy, InodeChecksumResult, InodeChecksumVerifier,
+    InodeVerificationStats,
 };
 use nexfsck_gpu::{BlockInterval, GpuAccelerator};
 use nexfsck_io::{BlockDevice, IoBackend};
@@ -148,6 +150,74 @@ struct Args {
     io_backend: IoChoice,
 }
 
+fn unsupported_ext4_feature(sb: &nexfsck_core::Ext4Superblock) -> Option<&'static str> {
+    use nexfsck_core::*;
+    if sb.desc_size() > 64 {
+        return Some("group descriptors larger than 64 bytes");
+    }
+    let incompat = u32::from_le(sb.s_feature_incompat);
+    let incompat_known = EXT4_FEATURE_INCOMPAT_FILETYPE
+        | EXT4_FEATURE_INCOMPAT_RECOVER
+        | EXT4_FEATURE_INCOMPAT_JOURNAL_DEV
+        | EXT4_FEATURE_INCOMPAT_META_BG
+        | EXT4_FEATURE_INCOMPAT_EXTENTS
+        | EXT4_FEATURE_INCOMPAT_64BIT
+        | EXT4_FEATURE_INCOMPAT_MMP
+        | EXT4_FEATURE_INCOMPAT_FLEX_BG
+        | EXT4_FEATURE_INCOMPAT_CSUM_SEED
+        | EXT4_FEATURE_INCOMPAT_EA_INODE
+        | EXT4_FEATURE_INCOMPAT_LARGEDIR
+        | EXT4_FEATURE_INCOMPAT_INLINE_DATA
+        | EXT4_FEATURE_INCOMPAT_ENCRYPT
+        | EXT4_FEATURE_INCOMPAT_CASEFOLD;
+    if incompat & !incompat_known != 0 {
+        return Some("unknown incompat feature bits");
+    }
+    for (bit, name) in [
+        (EXT4_FEATURE_INCOMPAT_RECOVER, "needs_journal_recovery"),
+        (EXT4_FEATURE_INCOMPAT_JOURNAL_DEV, "external_journal_device"),
+        (
+            EXT4_FEATURE_INCOMPAT_MMP,
+            "MMP checksum validation is incomplete",
+        ),
+        (EXT4_FEATURE_INCOMPAT_EA_INODE, "ea_inode"),
+        (EXT4_FEATURE_INCOMPAT_LARGEDIR, "large_dir"),
+        (EXT4_FEATURE_INCOMPAT_INLINE_DATA, "inline_data"),
+        (EXT4_FEATURE_INCOMPAT_ENCRYPT, "encryption"),
+        (EXT4_FEATURE_INCOMPAT_CASEFOLD, "casefold"),
+    ] {
+        if incompat & bit != 0 {
+            return Some(name);
+        }
+    }
+    let ro = u32::from_le(sb.s_feature_ro_compat);
+    let ro_known = EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER
+        | EXT4_FEATURE_RO_COMPAT_LARGE_FILE
+        | EXT4_FEATURE_RO_COMPAT_BTREE_DIR
+        | EXT4_FEATURE_RO_COMPAT_HUGE_FILE
+        | EXT4_FEATURE_RO_COMPAT_GDT_CSUM
+        | EXT4_FEATURE_RO_COMPAT_DIR_NLINK
+        | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE
+        | EXT4_FEATURE_RO_COMPAT_METADATA_CSUM;
+    if ro & !ro_known != 0 {
+        return Some("unknown or unverified ro_compat feature bits");
+    }
+    for (bit, name) in [
+        (EXT4_FEATURE_RO_COMPAT_QUOTA, "quota metadata"),
+        (EXT4_FEATURE_RO_COMPAT_BIGALLOC, "bigalloc"),
+        (EXT4_FEATURE_RO_COMPAT_PROJECT, "project quota"),
+        (EXT4_FEATURE_RO_COMPAT_VERITY, "verity"),
+    ] {
+        if ro & bit != 0 {
+            return Some(name);
+        }
+    }
+    if u32::from_le(sb.s_feature_compat) & EXT4_FEATURE_COMPAT_ORPHAN_FILE != 0 {
+        return Some("orphan_file");
+    }
+    None
+}
+
 fn main() -> ExitCode {
     let process_start = Instant::now();
     let args = Args::parse();
@@ -250,13 +320,41 @@ fn main() -> ExitCode {
 
     // 3. Read Superblock (Primary or Backup Hunter)
     let sb = if let Some(blk) = args.backup_sb {
-        info!("Using specified backup superblock at block {}", blk);
-        match dev.read_superblock_at_block(blk, 4096) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to read backup superblock at block {}: {}", blk, e);
-                return ExitCode::from(FSCK_EXIT_ERRORS_UNCORRECTED);
+        let mut selected = None;
+        let mut invalid_checksum = false;
+        let mut last_error = None;
+        for block_size in [4096, 2048, 1024] {
+            match dev.read_superblock_at_block(blk, block_size) {
+                Ok(candidate) => {
+                    let verifier = Ext4MetadataChecksum::new(&candidate);
+                    if verifier.verify_superblock(candidate.as_bytes()) {
+                        selected = Some(candidate);
+                        break;
+                    }
+                    invalid_checksum = true;
+                }
+                Err(error) => last_error = Some(error),
             }
+        }
+        if let Some(candidate) = selected {
+            info!(
+                "Using checksum-validated backup superblock at block {}",
+                blk
+            );
+            candidate
+        } else {
+            error!(
+                "Backup superblock at block {} could not be validated: {}",
+                blk,
+                last_error.map_or_else(
+                    || "invalid superblock checksum".to_string(),
+                    |e| e.to_string()
+                )
+            );
+            if invalid_checksum && args.json {
+                println!("{{\"superblock_checksum_failures\":1,\"errors_detected\":1}}");
+            }
+            return ExitCode::from(FSCK_EXIT_ERRORS_UNCORRECTED);
         }
     } else {
         match dev.read_superblock() {
@@ -267,7 +365,7 @@ fn main() -> ExitCode {
                 if !backups.is_empty() {
                     let blocks: Vec<u64> = backups.iter().map(|(b, _)| *b).collect();
                     warn!(
-                        "Primary superblock corrupted! Found valid backup superblock(s) at block(s): {:?}.",
+                        "Primary superblock is invalid. Backup superblock candidates at block(s): {:?}.",
                         blocks
                     );
                     warn!(
@@ -279,6 +377,32 @@ fn main() -> ExitCode {
             }
         }
     };
+    let metadata_checksum = Ext4MetadataChecksum::new(&sb);
+    let checksum_started = Instant::now();
+    let superblock_checksum_valid = metadata_checksum.verify_superblock(sb.as_bytes());
+    profile.record("superblock_checksum_validation", checksum_started.elapsed());
+    if !superblock_checksum_valid {
+        error!("Selected superblock checksum is invalid");
+        let candidates = dev.find_backup_superblocks();
+        if !candidates.is_empty() {
+            let blocks: Vec<u64> = candidates.iter().map(|(block, _)| *block).collect();
+            warn!(
+                "Backup superblock candidates (checksum must be checked with --backup-sb): {:?}",
+                blocks
+            );
+        }
+        if args.json {
+            println!("{{\"superblock_checksum_failures\":1,\"errors_detected\":1}}");
+        }
+        return ExitCode::from(FSCK_EXIT_ERRORS_UNCORRECTED);
+    }
+    if let Some(feature) = unsupported_ext4_feature(&sb) {
+        error!(
+            "Filesystem feature '{}' is not supported by this checker; refusing to report it clean",
+            feature
+        );
+        return ExitCode::from(FSCK_EXIT_ERRORS_UNCORRECTED);
+    }
     profile.mark("superblock_initialization");
 
     // Multi-Mount Protection (MMP) Check
@@ -322,6 +446,32 @@ fn main() -> ExitCode {
             return ExitCode::from(FSCK_EXIT_ERRORS_UNCORRECTED);
         }
     };
+    let descriptor_size = sb.desc_size();
+    let checksum_started = Instant::now();
+    let bad_group_descriptors = group_descriptors
+        .iter()
+        .enumerate()
+        .filter(|(index, desc)| {
+            !metadata_checksum.verify_group_desc(*index as u32, desc, descriptor_size)
+        })
+        .count();
+    profile.record(
+        "group_descriptor_checksum_validation",
+        checksum_started.elapsed(),
+    );
+    if bad_group_descriptors != 0 {
+        error!(
+            "{} group descriptor checksum(s) are invalid",
+            bad_group_descriptors
+        );
+        if args.json {
+            println!(
+                "{{\"group_descriptor_checksum_failures\":{},\"errors_detected\":{}}}",
+                bad_group_descriptors, bad_group_descriptors
+            );
+        }
+        return ExitCode::from(FSCK_EXIT_ERRORS_UNCORRECTED);
+    }
     profile.mark("block_group_metadata_reads");
 
     // JBD2 Crash Recovery Journal Inspection
@@ -393,6 +543,8 @@ fn main() -> ExitCode {
     let mut directory_blocks_to_check = Vec::new();
     let mut directory_layouts: std::collections::HashMap<u32, (Vec<u64>, bool)> =
         std::collections::HashMap::new();
+    let mut inode_generations: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
     let mut all_scanned_inodes = Vec::new();
     let mut compute_intervals = Vec::new();
     let mut inode_table_read_time = Duration::ZERO;
@@ -426,9 +578,9 @@ fn main() -> ExitCode {
         inode_table_read_time += operation_started.elapsed();
         match table_result {
             Ok(table_bytes) => {
-                let operation_started = Instant::now();
                 let inode_size = sb.inode_size() as usize;
                 let first_inode = (bg_idx as u32) * sb.inodes_per_group() + 1;
+                let operation_started = Instant::now();
                 for (index, raw_inode) in table_bytes.chunks_exact(inode_size).enumerate() {
                     if matches!(
                         inode_checksum_verifier.verify(first_inode + index as u32, raw_inode),
@@ -442,8 +594,7 @@ fn main() -> ExitCode {
                 }
                 inode_checksum_time += operation_started.elapsed();
                 let operation_started = Instant::now();
-                let inodes =
-                    BlockDevice::parse_inodes_from_table(&table_bytes, sb.inode_size() as usize);
+                let inodes = BlockDevice::parse_inodes_from_table(&table_bytes, inode_size);
                 inode_decode_time += operation_started.elapsed();
                 inactive_inode_count +=
                     inodes.iter().filter(|inode| !inode.is_used()).count() as u64;
@@ -451,7 +602,9 @@ fn main() -> ExitCode {
                 let operation_started = Instant::now();
                 for (i, inode) in inodes.iter().enumerate() {
                     let ino_num = (bg_idx as u32) * sb.inodes_per_group() + (i as u32) + 1;
+                    let generation = u32::from_le(inode.i_generation);
                     if inode.is_used() && inode.is_dir() {
+                        inode_generations.insert(ino_num, generation);
                         let blocks = collect_directory_blocks(inode, &|blk| {
                             dev.read_block(blk, block_size).ok()
                         });
@@ -614,8 +767,26 @@ fn main() -> ExitCode {
     let htree_time = htree_started.elapsed();
 
     let dirent_started = Instant::now();
+    let mut directory_checksum_time = Duration::ZERO;
     for (_dir_ino, dir_block) in directory_blocks_to_check {
         if let Some(block_bytes) = block_cache.get(&dir_block) {
+            let is_root = directory_layouts
+                .get(&_dir_ino)
+                .is_some_and(|(layout, indexed)| *indexed && layout.first() == Some(&dir_block));
+            let generation = inode_generations.get(&_dir_ino).copied().unwrap_or(0);
+            let checksum_started = Instant::now();
+            let checksum_valid = metadata_checksum.verify_directory_block(
+                _dir_ino,
+                generation,
+                block_bytes,
+                is_root,
+            );
+            directory_checksum_time += checksum_started.elapsed();
+            if !checksum_valid {
+                inode_stats
+                    .directory_checksum_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let res = verify_directory_block_compact(block_bytes, sb.total_inodes());
             total_dentry_count += res.entries.len();
             if res.corrupt_entries > 0 {
@@ -637,6 +808,7 @@ fn main() -> ExitCode {
     profile.record("directory_block_reads", directory_read_time);
     profile.record("directory_block_cache_build", directory_cache_build_time);
     profile.record("directory_htree_validation", htree_time);
+    profile.record("directory_checksum_validation", directory_checksum_time);
     profile.record("directory_dirent_parse_and_reference_arrays", dirent_time);
     let corrupt_dirs = inode_stats.corrupt_directories.load(Ordering::Relaxed);
     if !args.json {
@@ -720,8 +892,10 @@ fn main() -> ExitCode {
     let mut inode_bitmap_read_time = Duration::ZERO;
     let mut block_bitmap_compare_time = Duration::ZERO;
     let mut inode_bitmap_compare_time = Duration::ZERO;
+    let mut block_bitmap_checksum_time = Duration::ZERO;
+    let mut inode_bitmap_checksum_time = Duration::ZERO;
     for (bg_idx, desc) in group_descriptors.iter().enumerate() {
-        if desc.is_block_uninit() {
+        if desc.is_block_uninit() && desc.is_inode_uninit() {
             continue;
         }
 
@@ -731,40 +905,85 @@ fn main() -> ExitCode {
         }
         let blocks_in_this_group = (total_blocks - first_block).min(blocks_per_group as u64) as u32;
 
-        let operation_started = Instant::now();
-        let block_bitmap = dev.read_block_bitmap(desc, is_64bit, block_size);
-        block_bitmap_read_time += operation_started.elapsed();
-        if let Ok(disk_bm) = block_bitmap {
+        if !desc.is_block_uninit() {
             let operation_started = Instant::now();
-            let disc =
-                reconcile_block_bitmap(&disk_bm, &tracker, first_block, blocks_in_this_group);
-            block_bitmap_compare_time += operation_started.elapsed();
-            total_block_discrepancy.false_free_blocks += disc.false_free_blocks;
-            total_block_discrepancy.leaked_blocks += disc.leaked_blocks;
+            let block_bitmap = dev.read_block_bitmap(desc, is_64bit, block_size);
+            block_bitmap_read_time += operation_started.elapsed();
+            if let Ok(disk_bm) = block_bitmap {
+                let checksum_started = Instant::now();
+                let checksum_valid = metadata_checksum.verify_block_bitmap(
+                    bg_idx as u32,
+                    &disk_bm,
+                    desc,
+                    descriptor_size,
+                );
+                block_bitmap_checksum_time += checksum_started.elapsed();
+                if !checksum_valid {
+                    inode_stats
+                        .block_bitmap_checksum_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    let operation_started = Instant::now();
+                    let disc = reconcile_block_bitmap(
+                        &disk_bm,
+                        &tracker,
+                        first_block,
+                        blocks_in_this_group,
+                    );
+                    block_bitmap_compare_time += operation_started.elapsed();
+                    total_block_discrepancy.false_free_blocks += disc.false_free_blocks;
+                    total_block_discrepancy.leaked_blocks += disc.leaked_blocks;
+                }
+            }
         }
 
-        let operation_started = Instant::now();
-        let inode_bitmap = dev.read_inode_bitmap(desc, is_64bit, block_size);
-        inode_bitmap_read_time += operation_started.elapsed();
-        if let Ok(disk_inomb) = inode_bitmap {
-            if let Some((_, inodes)) = all_scanned_inodes.iter().find(|(idx, _)| *idx == bg_idx) {
-                let operation_started = Instant::now();
-                let disc = reconcile_inode_bitmap(
-                    &disk_inomb,
-                    inodes,
-                    sb.first_inode(),
-                    bg_idx,
-                    sb.inodes_per_group(),
+        if !desc.is_inode_uninit() {
+            let operation_started = Instant::now();
+            let inode_bitmap = dev.read_inode_bitmap(desc, is_64bit, block_size);
+            inode_bitmap_read_time += operation_started.elapsed();
+            if let Ok(disk_inomb) = inode_bitmap {
+                let checksum_started = Instant::now();
+                let checksum_valid = metadata_checksum.verify_inode_bitmap(
+                    bg_idx as u32,
+                    &disk_inomb
+                        [..((sb.inodes_per_group() as usize).div_ceil(8)).min(disk_inomb.len())],
+                    desc,
+                    descriptor_size,
                 );
-                inode_bitmap_compare_time += operation_started.elapsed();
-                total_inode_discrepancy.false_free_inodes += disc.false_free_inodes;
-                total_inode_discrepancy.leaked_inodes += disc.leaked_inodes;
+                inode_bitmap_checksum_time += checksum_started.elapsed();
+                if !checksum_valid {
+                    inode_stats
+                        .inode_bitmap_checksum_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                } else if let Some((_, inodes)) =
+                    all_scanned_inodes.iter().find(|(idx, _)| *idx == bg_idx)
+                {
+                    let operation_started = Instant::now();
+                    let disc = reconcile_inode_bitmap(
+                        &disk_inomb,
+                        inodes,
+                        sb.first_inode(),
+                        bg_idx,
+                        sb.inodes_per_group(),
+                    );
+                    inode_bitmap_compare_time += operation_started.elapsed();
+                    total_inode_discrepancy.false_free_inodes += disc.false_free_inodes;
+                    total_inode_discrepancy.leaked_inodes += disc.leaked_inodes;
+                }
             }
         }
     }
     profile.mark("bitmap_reconciliation");
     profile.record("block_bitmap_reads", block_bitmap_read_time);
     profile.record("inode_bitmap_reads", inode_bitmap_read_time);
+    profile.record(
+        "block_bitmap_checksum_validation",
+        block_bitmap_checksum_time,
+    );
+    profile.record(
+        "inode_bitmap_checksum_validation",
+        inode_bitmap_checksum_time,
+    );
     profile.record("block_bitmap_word_comparison", block_bitmap_compare_time);
     profile.record("inode_bitmap_comparison", inode_bitmap_compare_time);
 
@@ -776,6 +995,18 @@ fn main() -> ExitCode {
     let orphan_dirs = inode_stats.orphan_directories.load(Ordering::Relaxed);
     let link_mismatches = inode_stats.link_count_mismatches.load(Ordering::Relaxed);
     let inode_checksum_failures = inode_stats.inode_checksum_failures.load(Ordering::Relaxed);
+    let block_bitmap_checksum_failures = inode_stats
+        .block_bitmap_checksum_failures
+        .load(Ordering::Relaxed);
+    let inode_bitmap_checksum_failures = inode_stats
+        .inode_bitmap_checksum_failures
+        .load(Ordering::Relaxed);
+    let directory_checksum_failures = inode_stats
+        .directory_checksum_failures
+        .load(Ordering::Relaxed);
+    let extent_block_checksum_failures = inode_stats
+        .extent_block_checksum_failures
+        .load(Ordering::Relaxed);
 
     stats.errors_found += corruptions
         + duplicates
@@ -785,6 +1016,10 @@ fn main() -> ExitCode {
         + orphan_dirs
         + link_mismatches
         + inode_checksum_failures
+        + block_bitmap_checksum_failures
+        + inode_bitmap_checksum_failures
+        + directory_checksum_failures
+        + extent_block_checksum_failures
         + total_block_discrepancy.false_free_blocks
         + total_inode_discrepancy.false_free_inodes
         + dev.media_errors();
@@ -963,6 +1198,24 @@ fn main() -> ExitCode {
         println!(
             "  \"inode_checksum_failures\": {},",
             inode_checksum_failures
+        );
+        println!("  \"superblock_checksum_failures\": 0,");
+        println!("  \"group_descriptor_checksum_failures\": 0,");
+        println!(
+            "  \"block_bitmap_checksum_failures\": {},",
+            block_bitmap_checksum_failures
+        );
+        println!(
+            "  \"inode_bitmap_checksum_failures\": {},",
+            inode_bitmap_checksum_failures
+        );
+        println!(
+            "  \"directory_checksum_failures\": {},",
+            directory_checksum_failures
+        );
+        println!(
+            "  \"extent_block_checksum_failures\": {},",
+            extent_block_checksum_failures
         );
         println!("  \"extent_corruptions\": {},", corruptions);
         println!("  \"duplicate_blocks\": {},", duplicates);
