@@ -17,6 +17,10 @@ This inventory reflects the automated tests currently in the repository. It is d
 | 48-bit extent address composition | `test_extent_address_calculation` |
 | Unwritten extent flag handling | `test_extent_unwritten` |
 | CRC32c known vector and hardware/scalar equivalence | `crc32c_known_vector`, `dispatched_crc_matches_scalar_for_lengths_and_seeds` |
+| Inode CRC32c layout/seed semantics and real-image corruption oracle | `inode_checksum_matches_independent_reference_across_layouts_and_seeds`, `inode_checksum_feature_and_unused_inode_semantics_match_e2fsprogs`, `test_real_ext4_inode_checksum_clean_layouts_and_seed_modes`, `test_real_ext4_inode_checksum_corruption_matches_e2fsprogs` |
+| Superblock, group descriptor, block/inode bitmap checksum corruption oracles | `test_metadata_checksum_corruption_oracle` |
+| Directory leaf and indexed HTree checksum corruption oracles | `test_directory_checksum_corruption_oracle`, `test_htree_checksum_corruption_oracle` |
+| Unsupported feature fail-closed behavior | `test_unsupported_feature_fails_closed` |
 | H-Tree root/leaf validation and child bounds | `validates_minimal_htree_root_and_leaf`, `rejects_out_of_bounds_htree_child` |
 | CUDA/CPU collision equivalence; CUDA required with env flag | `collision_detection_is_deterministic` |
 | JBD2 committed, incomplete, revoked, checksum-v3, and 64-bit transactions | `plans_only_committed_jbd2_data`, `ignores_uncommitted_tail`, `revoke_removes_committed_write`, `validates_checksum_v3_and_64bit_target` |
