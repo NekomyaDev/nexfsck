@@ -33,9 +33,9 @@ New performance claims must include the fixture-generation command, CPU, RAM, st
 
 ### Latest measured 10 GiB run
 
-On the committed 10 GiB sparse fixture (100,000 generated files, 80 block groups, `/tmp` tmpfs), 10 interleaved warm-cache repetitions measured median wall times of **0.130 s for e2fsck** and **0.053 s for adaptive nexfsck**. Both reported 1,182,223 allocated blocks; nexfsck reported zero errors. Nexfsck also completed 30/30 endurance passes with observed peak RSS between 37.62 and 37.87 MiB, followed by successful corruption detection, repair, verification, rollback, and restored-corruption detection.
+On the committed 10 GiB sparse fixture (100,000 generated files, 80 block groups, `/tmp` tmpfs), 10 interleaved warm-cache repetitions measured median wall times of **0.1258 s for e2fsck** and **0.0517 s for adaptive nexfsck**. Both reported 1,182,225 allocated blocks; nexfsck reported zero errors. This run includes complete ext4 inode checksum verification. Nexfsck also completed 30/30 endurance passes with observed peak RSS between 36.36 and 36.61 MiB, followed by successful corruption detection, repair, verification, rollback, and restored-corruption detection.
 
-The controlled backend matrix measured 0.261 s (`io_uring`+CUDA), 0.054 s (`io_uring`+CPU), 0.252 s (sync+CUDA), 0.0476 s (sync+CPU), and 0.0484 s (adaptive) medians. Use `--profile` for the phase timing report. CUDA remains available as an explicit diagnostic override; it is not selected merely because a GPU is present.
+The controlled backend matrix measured 0.2511 s (`io_uring`+CUDA), 0.0564 s (`io_uring`+CPU), 0.2474 s (sync+CUDA), 0.0506 s (sync+CPU), and 0.0514 s (adaptive) medians. Use `--profile` for the phase timing report. CUDA remains available as an explicit diagnostic override; it is not selected merely because a GPU is present.
 
 These are environment-specific selected-counter results, not bit-exact parity or production-storage performance. The fixture was memory-backed and cache was not globally dropped. See the machine-readable [`benchmark-results/latest.json`](benchmark-results/latest.json), raw logs in [`benchmark-results`](benchmark-results), and the reproducible runner [`scripts/stress_benchmark.py`](scripts/stress_benchmark.py).
 

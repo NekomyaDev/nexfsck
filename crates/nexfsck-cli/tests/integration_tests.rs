@@ -139,7 +139,12 @@ fn test_real_ext4_inode_checksum_corruption_matches_e2fsprogs() {
     let inode_start = block * 4096 + offset;
 
     for (label, relative_offset) in [
-        ("metadata", 40u64),
+        ("mode-type", 0u64),
+        ("link-count", 26u64),
+        ("extent-root", 40u64),
+        ("extent-header", 42u64),
+        ("extent-depth", 46u64),
+        ("extent-bounds", 52u64),
         ("generation", 100u64),
         ("stored-checksum", 124u64),
     ] {

@@ -67,6 +67,9 @@ def unmount():
     subprocess.check_call(["sudo", "umount", MOUNT])
 
 def main():
+    benchmarked_source_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
     results = []
     image = "/tmp/nexfsck_inode_heavy.img"
     try:
@@ -102,7 +105,19 @@ def main():
         shutil.rmtree(MOUNT, ignore_errors=True)
 
     with open(OUT, "w") as output:
-        json.dump({"schema_version": 1, "profiles": results}, output, indent=2)
+        json.dump(
+            {
+                "schema_version": 2,
+                "benchmarked_source_commit": benchmarked_source_commit,
+                "artifact_publication_commit": None,
+                "artifact_publication_commit_resolution": (
+                    "git log -1 --format=%H -- benchmark-results/workload-profiles.json"
+                ),
+                "profiles": results,
+            },
+            output,
+            indent=2,
+        )
         output.write("\n")
     print(json.dumps(results, indent=2))
 

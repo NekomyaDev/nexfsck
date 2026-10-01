@@ -74,6 +74,28 @@ overhead. Rayon remains enabled for batches above 16,384 inodes.
 
 ## Correctness and limitations
 
+### Inode checksum correctness cost
+
+Commit `dbc61335a6331e433e4de76ed473c0d62e96692e` added full raw-inode
+CRC32c verification to the real scan path. It covers the inode number,
+generation, complete configured inode size, low/high checksum fields, UUID seed,
+and explicit `metadata_csum_seed` semantics. Tests use real e2fsprogs-created
+128-byte and 256-byte inode images and require both nexfsck and e2fsck to reject
+metadata, generation, and stored-checksum corruption.
+
+On the final clean-revision 10 GiB run, checksum validation consumed 6.639 ms.
+The complete inode/extent phase was 30.937 ms: table reads 6.444 ms, inode
+decoding 10.297 ms, metadata/extent collection 5.024 ms, and validation/allocation
+tracking 2.213 ms. Directory validation was 10.730 ms, of which block reads were
+6.830 ms. Bitmap reconciliation remained below 1 ms. Full external medians were
+51.713 ms for nexfsck and 125.783 ms for e2fsck; nexfsck p95 was 53.557 ms and
+population standard deviation was 0.847 ms. Peak RSS was 36.61 MiB.
+
+The checksum seed is computed once per filesystem and hardware CRC dispatch is
+performed once per inode checksum chain. A fused checksum/decode timer was not
+retained because it would obscure the independently measured correctness cost;
+the existing two linear table passes remain a documented optimization target.
+
 The final comparison measured e2fsck at 0.127931 s and adaptive nexfsck at
 0.118554 s median (1.08x for nexfsck on this fixture only). Allocated blocks
 matched at 1,182,220 and nexfsck reported zero errors. All 30 endurance passes,
