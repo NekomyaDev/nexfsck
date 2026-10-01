@@ -1175,99 +1175,241 @@ pub fn verify_extent_block<F>(
 ) where
     F: Fn(u64) -> Option<Vec<u8>>,
 {
+    let mut visited = std::collections::HashSet::new();
+    let context = ExtentValidationContext {
+        checksum_context,
+        max_blocks,
+        tracker,
+        stats,
+        read_block_fn: &read_block_fn,
+    };
+    let _ = verify_extent_node(data, &context, current_depth, None, &mut visited);
+}
+
+/// Returns the node's logical range as `(first, end_exclusive)`. The visited
+/// set is per inode tree, so cycles and child-node aliasing are rejected even
+/// when both references are otherwise in filesystem bounds.
+struct ExtentValidationContext<'a, F>
+where
+    F: Fn(u64) -> Option<Vec<u8>>,
+{
+    checksum_context: ExtentTreeChecksumContext,
+    max_blocks: u64,
+    tracker: &'a BlockAllocationTracker,
+    stats: &'a InodeVerificationStats,
+    read_block_fn: &'a F,
+}
+
+fn verify_extent_node<F>(
+    data: &[u8],
+    context: &ExtentValidationContext<'_, F>,
+    current_depth: u16,
+    expected: Option<(u16, u32)>,
+    visited: &mut std::collections::HashSet<u64>,
+) -> Option<(u32, u64)>
+where
+    F: Fn(u64) -> Option<Vec<u8>>,
+{
+    let corrupt = || {
+        context
+            .stats
+            .extent_corruptions
+            .fetch_add(1, Ordering::Relaxed);
+    };
     if current_depth > 5 {
-        stats.extent_corruptions.fetch_add(1, Ordering::Relaxed);
-        return;
+        corrupt();
+        return None;
     }
 
     if current_depth > 0
-        && !checksum_context.metadata_checksum.verify_extent_tree_block(
-            checksum_context.inode_number,
-            checksum_context.inode_generation,
-            data,
-        )
+        && !context
+            .checksum_context
+            .metadata_checksum
+            .verify_extent_tree_block(
+                context.checksum_context.inode_number,
+                context.checksum_context.inode_generation,
+                data,
+            )
     {
-        stats
+        context
+            .stats
             .extent_block_checksum_failures
             .fetch_add(1, Ordering::Relaxed);
-        return;
+        return None;
     }
 
     let (header, rest) = match Ext4ExtentHeader::ref_from_prefix(data) {
         Ok(res) => res,
         Err(_) => {
-            stats.extent_corruptions.fetch_add(1, Ordering::Relaxed);
-            return;
+            corrupt();
+            return None;
         }
     };
 
     if !header.is_valid_magic() {
-        stats.extent_corruptions.fetch_add(1, Ordering::Relaxed);
-        return;
+        corrupt();
+        return None;
     }
 
     let entries = header.entries() as usize;
     let max_entries = header.max() as usize;
+    let depth = header.depth();
+    if depth > 5 || (current_depth > 0 && entries == 0) || (depth == 0 && max_entries == 0) {
+        corrupt();
+        return None;
+    }
+    let extent_size = std::mem::size_of::<Ext4Extent>();
+    let entry_size = if depth == 0 {
+        extent_size
+    } else {
+        std::mem::size_of::<Ext4ExtentIdx>()
+    };
+    let external_tail =
+        usize::from(current_depth > 0 && metadata_checksum_enabled(context.checksum_context)) * 4;
+    let physical_capacity = data
+        .len()
+        .saturating_sub(std::mem::size_of::<Ext4ExtentHeader>() + external_tail)
+        / entry_size;
 
-    if entries > max_entries {
-        stats.extent_corruptions.fetch_add(1, Ordering::Relaxed);
-        return;
+    if entries > max_entries || max_entries > physical_capacity {
+        corrupt();
+        return None;
+    }
+
+    if expected.is_some_and(|(parent_depth, _)| depth != parent_depth) {
+        corrupt();
+        return None;
     }
 
     if header.depth() == 0 {
         // Leaf nodes
-        let extent_size = std::mem::size_of::<Ext4Extent>();
+        let mut first = None;
+        let mut previous_end = None;
         for i in 0..entries {
             let offset = i * extent_size;
             if offset + extent_size > rest.len() {
-                stats.extent_corruptions.fetch_add(1, Ordering::Relaxed);
-                break;
+                corrupt();
+                return None;
             }
 
-            if let Ok((ext, _)) = Ext4Extent::ref_from_prefix(&rest[offset..]) {
-                let start_block = ext.physical_start();
-                let count = ext.block_count();
-
-                if start_block + count as u64 > max_blocks {
-                    stats.out_of_bounds_blocks.fetch_add(1, Ordering::Relaxed);
-                } else if !tracker.mark_range(start_block, count) {
-                    stats.duplicate_blocks.fetch_add(1, Ordering::Relaxed);
-                }
+            let Ok((ext, _)) = Ext4Extent::ref_from_prefix(&rest[offset..]) else {
+                corrupt();
+                return None;
+            };
+            let logical = ext.logical_block();
+            let count = ext.block_count();
+            let logical_end = logical as u64 + count as u64;
+            let start_block = ext.physical_start();
+            let Some(physical_end) = start_block.checked_add(count as u64) else {
+                context
+                    .stats
+                    .out_of_bounds_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            if count == 0
+                || previous_end.is_some_and(|end| (logical as u64) < end)
+                || logical_end > (u32::MAX as u64 + 1)
+            {
+                corrupt();
+                return None;
+            }
+            if start_block == 0 || physical_end > context.max_blocks {
+                context
+                    .stats
+                    .out_of_bounds_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if !context.tracker.mark_range(start_block, count) {
+                context
+                    .stats
+                    .duplicate_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            first.get_or_insert(logical);
+            previous_end = Some(logical_end);
+        }
+        let range = first.zip(previous_end);
+        if let (Some((_, key)), Some((first, _))) = (expected, range) {
+            if first != key {
+                corrupt();
+                return None;
             }
         }
+        range
     } else {
         // Branch index nodes (Ext4ExtentIdx)
         let idx_size = std::mem::size_of::<Ext4ExtentIdx>();
+        let mut first = None;
+        let mut previous_key = None;
+        let mut previous_end = None;
         for i in 0..entries {
             let offset = i * idx_size;
             if offset + idx_size > rest.len() {
-                stats.extent_corruptions.fetch_add(1, Ordering::Relaxed);
-                break;
+                corrupt();
+                return None;
             }
 
-            if let Ok((idx, _)) = Ext4ExtentIdx::ref_from_prefix(&rest[offset..]) {
-                let child_block = idx.child_block();
-                if child_block >= max_blocks {
-                    stats.out_of_bounds_blocks.fetch_add(1, Ordering::Relaxed);
-                    continue;
+            let Ok((idx, _)) = Ext4ExtentIdx::ref_from_prefix(&rest[offset..]) else {
+                corrupt();
+                return None;
+            };
+            let key = idx.logical_block();
+            if previous_key.is_some_and(|previous| key <= previous) {
+                corrupt();
+                return None;
+            }
+            previous_key = Some(key);
+            let child_block = idx.child_block();
+            if child_block == 0 || child_block >= context.max_blocks {
+                context
+                    .stats
+                    .out_of_bounds_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if !visited.insert(child_block) {
+                corrupt();
+                continue;
+            }
+            if !context.tracker.mark_range(child_block, 1) {
+                context
+                    .stats
+                    .duplicate_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(child_data) = (context.read_block_fn)(child_block) {
+                if let Some((child_first, child_end)) = verify_extent_node(
+                    &child_data,
+                    context,
+                    current_depth + 1,
+                    Some((depth - 1, key)),
+                    visited,
+                ) {
+                    if previous_end.is_some_and(|end| (child_first as u64) < end) {
+                        corrupt();
+                    }
+                    first.get_or_insert(child_first);
+                    previous_end = Some(child_end);
+                } else {
+                    corrupt();
                 }
-
-                tracker.mark_range(child_block, 1);
-
-                if let Some(child_data) = read_block_fn(child_block) {
-                    verify_extent_block(
-                        &child_data,
-                        checksum_context,
-                        max_blocks,
-                        tracker,
-                        stats,
-                        read_block_fn,
-                        current_depth + 1,
-                    );
-                }
+            } else {
+                corrupt();
             }
         }
+        let range = first.zip(previous_end);
+        if let (Some((_, key)), Some((first, _))) = (expected, range) {
+            if first != key {
+                corrupt();
+                return None;
+            }
+        }
+        range
     }
+}
+
+fn metadata_checksum_enabled(context: ExtentTreeChecksumContext) -> bool {
+    context.metadata_checksum.enabled
 }
 
 /// Discrepancy statistics when comparing on-disk bitmaps against in-memory tracker.
@@ -1789,6 +1931,83 @@ mod htree_tests {
             .errors
             .iter()
             .any(|error| error.contains("out of bounds")));
+    }
+}
+
+#[cfg(test)]
+mod extent_semantic_tests {
+    use super::*;
+
+    fn root(depth: u16, entries: u16, max: u16) -> Vec<u8> {
+        let mut bytes = vec![0u8; 60];
+        bytes[0..2].copy_from_slice(&nexfsck_core::EXT4_EXTENT_MAGIC.to_le_bytes());
+        bytes[2..4].copy_from_slice(&entries.to_le_bytes());
+        bytes[4..6].copy_from_slice(&max.to_le_bytes());
+        bytes[6..8].copy_from_slice(&depth.to_le_bytes());
+        bytes
+    }
+
+    fn context() -> ExtentTreeChecksumContext {
+        let raw = [0u8; 1024];
+        let sb = *Ext4Superblock::ref_from_prefix(&raw).unwrap().0;
+        ExtentTreeChecksumContext {
+            inode_number: 12,
+            inode_generation: 1,
+            metadata_checksum: Ext4MetadataChecksum::new(&sb),
+        }
+    }
+
+    #[test]
+    fn accepts_initialized_extent_at_length_boundary() {
+        let mut bytes = root(0, 1, 4);
+        bytes[12..16].copy_from_slice(&3u32.to_le_bytes());
+        bytes[16..18].copy_from_slice(&0x8000u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        let tracker = BlockAllocationTracker::new(40_000);
+        let stats = InodeVerificationStats::new();
+        verify_extent_block(&bytes, context(), 40_000, &tracker, &stats, &|_| None, 0);
+        assert_eq!(stats.extent_corruptions.load(Ordering::Relaxed), 0);
+        assert_eq!(tracker.allocated_count(), 0x8000);
+    }
+
+    #[test]
+    fn rejects_zero_length_extent_and_reused_child_node() {
+        let mut leaf = root(0, 1, 4);
+        leaf[12..16].copy_from_slice(&1u32.to_le_bytes());
+        leaf[20..24].copy_from_slice(&8u32.to_le_bytes());
+        let stats = InodeVerificationStats::new();
+        verify_extent_block(
+            &leaf,
+            context(),
+            100,
+            &BlockAllocationTracker::new(100),
+            &stats,
+            &|_| None,
+            0,
+        );
+        assert_eq!(stats.extent_corruptions.load(Ordering::Relaxed), 1);
+
+        let mut inode_root = root(2, 1, 4);
+        inode_root[12..16].copy_from_slice(&0u32.to_le_bytes());
+        inode_root[16..20].copy_from_slice(&10u32.to_le_bytes());
+        let mut child = vec![0u8; 4096];
+        child[0..2].copy_from_slice(&nexfsck_core::EXT4_EXTENT_MAGIC.to_le_bytes());
+        child[2..4].copy_from_slice(&1u16.to_le_bytes());
+        child[4..6].copy_from_slice(&340u16.to_le_bytes());
+        child[6..8].copy_from_slice(&1u16.to_le_bytes());
+        child[12..16].copy_from_slice(&0u32.to_le_bytes());
+        child[16..20].copy_from_slice(&10u32.to_le_bytes());
+        let stats = InodeVerificationStats::new();
+        verify_extent_block(
+            &inode_root,
+            context(),
+            100,
+            &BlockAllocationTracker::new(100),
+            &stats,
+            &|block| (block == 10).then(|| child.clone()),
+            0,
+        );
+        assert!(stats.extent_corruptions.load(Ordering::Relaxed) > 0);
     }
 }
 

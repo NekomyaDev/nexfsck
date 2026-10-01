@@ -224,13 +224,135 @@ fn unsupported_ext4_feature(sb: &nexfsck_core::Ext4Superblock) -> Option<&'stati
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairBlockReason {
+    MetadataChecksumFailure,
+    BackupGeometryConflict,
+    ExtentSemanticFailure,
+    XattrIntegrityFailure,
+    DirectoryReferenceFailure,
+    JournalIntegrityUnknown,
+    JournalReplayRequired,
+    MediaError,
+}
+
+impl RepairBlockReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::MetadataChecksumFailure => "metadata_checksum_failure",
+            Self::BackupGeometryConflict => "backup_geometry_conflict",
+            Self::ExtentSemanticFailure => "extent_semantic_failure",
+            Self::XattrIntegrityFailure => "xattr_integrity_failure",
+            Self::DirectoryReferenceFailure => "directory_reference_failure",
+            Self::JournalIntegrityUnknown => "journal_integrity_unknown",
+            Self::JournalReplayRequired => "journal_replay_required",
+            Self::MediaError => "media_error",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::MetadataChecksumFailure => "metadata checksum failure",
+            Self::BackupGeometryConflict => "backup superblock integrity/geometry conflict",
+            Self::ExtentSemanticFailure => "inode or extent structure is invalid",
+            Self::XattrIntegrityFailure => "external xattr structure or read is invalid",
+            Self::DirectoryReferenceFailure => "directory, symlink, or reference validation failed",
+            Self::JournalIntegrityUnknown => "journal integrity is uncertain",
+            Self::JournalReplayRequired => "journal replay is required and unsupported",
+            Self::MediaError => "storage read reported media errors",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct RepairTrustState {
-    blocked_reasons: Vec<&'static str>,
+    blocked_reasons: Vec<RepairBlockReason>,
+}
+
+#[derive(Debug, Default)]
+struct BackupSuperblockSummary {
+    checked: u64,
+    valid_consistent: u64,
+    invalid_checksum: u64,
+    invalid_magic_or_unreadable: u64,
+    inconsistent: u64,
+}
+
+fn verify_expected_backup_superblocks(
+    dev: &BlockDevice,
+    primary: &nexfsck_core::Ext4Superblock,
+    checksum: Ext4MetadataChecksum,
+) -> BackupSuperblockSummary {
+    let mut summary = BackupSuperblockSummary::default();
+    let block_size = primary.block_size();
+    let first_data = u64::from(u32::from_le(primary.s_first_data_block));
+    let blocks_per_group = u64::from(primary.blocks_per_group());
+    if block_size == 0 || blocks_per_group == 0 {
+        summary.invalid_magic_or_unreadable += 1;
+        return summary;
+    }
+
+    for group in 1..primary.block_groups_count() {
+        if !primary.group_has_superblock(group) {
+            continue;
+        }
+        let Some(block) = group
+            .checked_mul(blocks_per_group)
+            .and_then(|offset| first_data.checked_add(offset))
+        else {
+            summary.invalid_magic_or_unreadable += 1;
+            continue;
+        };
+        summary.checked += 1;
+        let candidate = match dev.read_superblock_at_block(block, block_size) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                summary.invalid_magic_or_unreadable += 1;
+                warn!(
+                    "Backup superblock group {group} at block {block} unreadable/invalid: {error}"
+                );
+                continue;
+            }
+        };
+        if !checksum.verify_superblock(candidate.as_bytes()) {
+            summary.invalid_checksum += 1;
+            warn!("Backup superblock group {group} at block {block} has an invalid checksum");
+            continue;
+        }
+        let same_geometry = candidate.total_blocks() == primary.total_blocks()
+            && candidate.total_inodes() == primary.total_inodes()
+            && candidate.block_size() == primary.block_size()
+            && candidate.blocks_per_group() == primary.blocks_per_group()
+            && candidate.inodes_per_group() == primary.inodes_per_group()
+            && candidate.inode_size() == primary.inode_size()
+            && candidate.desc_size() == primary.desc_size()
+            && candidate.s_uuid == primary.s_uuid
+            && candidate.s_feature_compat == primary.s_feature_compat
+            && candidate.s_feature_incompat == primary.s_feature_incompat
+            && candidate.s_feature_ro_compat == primary.s_feature_ro_compat
+            && candidate.s_checksum_type == primary.s_checksum_type
+            && candidate.s_checksum_seed == primary.s_checksum_seed
+            && u16::from_le(candidate.s_block_group_nr) as u64 == group;
+        if same_geometry {
+            summary.valid_consistent += 1;
+        } else {
+            summary.inconsistent += 1;
+            warn!("Backup superblock group {group} at block {block} has a valid checksum but disagrees with primary geometry/features");
+        }
+    }
+    info!(
+        "Backup superblocks: checked={}, valid_consistent={}, invalid_checksum={}, invalid_magic_or_unreadable={}, inconsistent={}",
+        summary.checked,
+        summary.valid_consistent,
+        summary.invalid_checksum,
+        summary.invalid_magic_or_unreadable,
+        summary.inconsistent
+    );
+    summary
 }
 
 impl RepairTrustState {
-    fn block(&mut self, reason: &'static str) {
+    fn block(&mut self, reason: RepairBlockReason) {
         if !self.blocked_reasons.contains(&reason) {
             self.blocked_reasons.push(reason);
         }
@@ -426,6 +548,10 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(FSCK_EXIT_ERRORS_UNCORRECTED);
     }
+    let backup_superblocks = verify_expected_backup_superblocks(&dev, &sb, metadata_checksum);
+    let backup_superblock_failures = backup_superblocks.invalid_checksum
+        + backup_superblocks.invalid_magic_or_unreadable
+        + backup_superblocks.inconsistent;
     profile.mark("superblock_initialization");
 
     // Multi-Mount Protection (MMP) Check
@@ -1105,22 +1231,28 @@ fn main() -> ExitCode {
     // reconstruct it is independently trustworthy.
     let mut repair_trust = RepairTrustState::default();
     if checksum_failures != 0 {
-        repair_trust.block("metadata checksum failure");
+        repair_trust.block(RepairBlockReason::MetadataChecksumFailure);
+    }
+    if backup_superblock_failures != 0 {
+        repair_trust.block(RepairBlockReason::BackupGeometryConflict);
     }
     if corruptions + duplicates + oob != 0 {
-        repair_trust.block("inode or extent structure is invalid");
+        repair_trust.block(RepairBlockReason::ExtentSemanticFailure);
     }
     if xattr_block_corruptions != 0 {
-        repair_trust.block("external xattr structure or read is invalid");
+        repair_trust.block(RepairBlockReason::XattrIntegrityFailure);
     }
     if corrupt_symlinks + corrupt_dirs + orphan_dirs + link_mismatches != 0 {
-        repair_trust.block("directory, symlink, or reference validation failed");
+        repair_trust.block(RepairBlockReason::DirectoryReferenceFailure);
     }
     if journal_is_dirty {
-        repair_trust.block("journal state is dirty or journal integrity is uncertain");
+        repair_trust.block(RepairBlockReason::JournalReplayRequired);
+    }
+    if journal_integrity_failures != 0 {
+        repair_trust.block(RepairBlockReason::JournalIntegrityUnknown);
     }
     if media_errors != 0 {
-        repair_trust.block("storage read reported media errors");
+        repair_trust.block(RepairBlockReason::MediaError);
     }
 
     stats.errors_found += corruptions
@@ -1137,6 +1269,7 @@ fn main() -> ExitCode {
         + extent_block_checksum_failures
         + xattr_block_corruptions
         + xattr_checksum_failures
+        + backup_superblock_failures
         + journal_integrity_failures
         + total_block_discrepancy.false_free_blocks
         + total_inode_discrepancy.false_free_inodes
@@ -1149,7 +1282,12 @@ fn main() -> ExitCode {
     if args.repair && has_repairable_errors && !repair_trust.is_eligible() {
         error!(
             "Repair blocked by trust policy: {}",
-            repair_trust.blocked_reasons.join("; ")
+            repair_trust
+                .blocked_reasons
+                .iter()
+                .map(|reason| reason.description())
+                .collect::<Vec<_>>()
+                .join("; ")
         );
     } else if args.repair && has_repairable_errors {
         info!("Active Repair Mode: Correcting false-free bitmaps with a flushed pre-image undo journal...");
@@ -1323,6 +1461,26 @@ fn main() -> ExitCode {
             inode_checksum_failures
         );
         println!("  \"superblock_checksum_failures\": 0,");
+        println!(
+            "  \"backup_superblocks_checked\": {},",
+            backup_superblocks.checked
+        );
+        println!(
+            "  \"backup_superblocks_valid_consistent\": {},",
+            backup_superblocks.valid_consistent
+        );
+        println!(
+            "  \"backup_superblocks_invalid_checksum\": {},",
+            backup_superblocks.invalid_checksum
+        );
+        println!(
+            "  \"backup_superblocks_invalid_or_unreadable\": {},",
+            backup_superblocks.invalid_magic_or_unreadable
+        );
+        println!(
+            "  \"backup_superblocks_inconsistent\": {},",
+            backup_superblocks.inconsistent
+        );
         println!("  \"group_descriptor_checksum_failures\": 0,");
         println!(
             "  \"block_bitmap_checksum_failures\": {},",
@@ -1380,7 +1538,7 @@ fn main() -> ExitCode {
             repair_trust
                 .blocked_reasons
                 .iter()
-                .map(|reason| format!("\"{reason}\""))
+                .map(|reason| format!("\"{}\"", reason.code()))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -1452,7 +1610,12 @@ fn main() -> ExitCode {
         if !repair_trust.is_eligible() {
             println!(
                 "Repair Blocked     : {}",
-                repair_trust.blocked_reasons.join("; ")
+                repair_trust
+                    .blocked_reasons
+                    .iter()
+                    .map(|reason| reason.description())
+                    .collect::<Vec<_>>()
+                    .join("; ")
             );
         }
         println!("--------------------------------------------------");

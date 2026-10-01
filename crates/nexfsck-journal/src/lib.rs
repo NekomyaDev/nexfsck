@@ -26,6 +26,7 @@ pub const JBD2_FLAG_DELETED: u32 = 4;
 pub const JBD2_FLAG_LAST_TAG: u32 = 8;
 pub const JBD2_FEATURE_INCOMPAT_REVOKE: u32 = 0x1;
 pub const JBD2_FEATURE_INCOMPAT_64BIT: u32 = 0x2;
+pub const JBD2_FEATURE_INCOMPAT_CSUM_V2: u32 = 0x8;
 pub const JBD2_FEATURE_INCOMPAT_CSUM_V3: u32 = 0x10;
 
 #[derive(Error, Debug)]
@@ -166,6 +167,93 @@ fn validate_inspected_journal_features(block: &[u8]) -> Result<JournalFeatures, 
         return Err(JournalError::CorruptLog(
             "JBD2 compat checksum metadata is not fully validated".into(),
         ));
+    }
+    let ro_compat = u32::from_be_bytes(
+        block
+            .get(44..48)
+            .ok_or_else(|| JournalError::CorruptLog("truncated JBD2 ro_compat flags".into()))?
+            .try_into()
+            .unwrap(),
+    );
+    if ro_compat != 0 {
+        return Err(JournalError::CorruptLog(format!(
+            "unsupported JBD2 read-only-compatible flags 0x{ro_compat:x}"
+        )));
+    }
+    Ok(features)
+}
+
+/// Validate the on-disk JBD2 superblock before using its clean/dirty fields.
+/// Linux defines the checksum over the 1024-byte journal_superblock_s, with
+/// s_checksum at 0xfc zeroed, using the kernel CRC32c convention.
+fn validate_journal_superblock_integrity(
+    block: &[u8],
+    expected_block_size: u64,
+) -> Result<JournalFeatures, JournalError> {
+    const JBD2_SUPERBLOCK_V1: u32 = 3;
+    const JBD2_SUPERBLOCK_V2: u32 = 4;
+    const JBD2_SUPERBLOCK_BYTES: usize = 1024;
+    const CHECKSUM_TYPE_OFFSET: usize = 0x50;
+    const CHECKSUM_OFFSET: usize = 0xfc;
+    if block.len() < JBD2_SUPERBLOCK_BYTES {
+        return Err(JournalError::CorruptLog(
+            "truncated JBD2 superblock (requires 1024 bytes)".into(),
+        ));
+    }
+    let header = parse_journal_header(block)?;
+    if header.magic() != JBD2_MAGIC_NUMBER {
+        return Err(JournalError::InvalidJournalMagic {
+            expected: JBD2_MAGIC_NUMBER,
+            found: header.magic(),
+        });
+    }
+    let block_type = header.block_type();
+    if block_type != JBD2_SUPERBLOCK_V1 && block_type != JBD2_SUPERBLOCK_V2 {
+        return Err(JournalError::CorruptLog(format!(
+            "unexpected JBD2 superblock type {block_type}"
+        )));
+    }
+    let block_size = u32::from_be_bytes(block[12..16].try_into().unwrap()) as u64;
+    let maxlen = u32::from_be_bytes(block[16..20].try_into().unwrap());
+    let first = u32::from_be_bytes(block[20..24].try_into().unwrap());
+    let start = u32::from_be_bytes(block[28..32].try_into().unwrap());
+    if block_size != expected_block_size
+        || block_size == 0
+        || !block_size.is_power_of_two()
+        || first == 0
+        || first >= maxlen
+        || (start != 0 && (start < first || start >= maxlen))
+    {
+        return Err(JournalError::CorruptLog(format!(
+            "invalid JBD2 superblock geometry/state: block_size={block_size}, maxlen={maxlen}, first={first}, start={start}"
+        )));
+    }
+    let features = validate_inspected_journal_features(block)?;
+    let incompat = u32::from_be_bytes(block[40..44].try_into().unwrap());
+    if incompat & JBD2_FEATURE_INCOMPAT_CSUM_V2 != 0 {
+        return Err(JournalError::CorruptLog(
+            "JBD2 checksum-v2 transaction format is not supported".into(),
+        ));
+    }
+    if incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0 {
+        if block_type != JBD2_SUPERBLOCK_V2 || block[CHECKSUM_TYPE_OFFSET] != 4 {
+            return Err(JournalError::CorruptLog(
+                "JBD2 checksum-v3 requires a v2 superblock and CRC32c".into(),
+            ));
+        }
+        let provided = u32::from_be_bytes(
+            block[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let mut bytes = block[..JBD2_SUPERBLOCK_BYTES].to_vec();
+        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].fill(0);
+        let calculated = crc32c_kernel(!0, &bytes);
+        if provided != calculated {
+            return Err(JournalError::CorruptLog(
+                "JBD2 superblock checksum mismatch".into(),
+            ));
+        }
     }
     Ok(features)
 }
@@ -675,7 +763,7 @@ pub fn inspect_journal(
     let (jbd_sb, _) = Jbd2Superblock::ref_from_prefix(&block_bytes)
         .map_err(|_| JournalError::CorruptLog("truncated JBD2 superblock".into()))?;
     jbd_sb.verify_magic()?;
-    validate_inspected_journal_features(&block_bytes)?;
+    validate_journal_superblock_integrity(&block_bytes, sb.block_size())?;
     Ok(Some(*jbd_sb))
 }
 
@@ -704,6 +792,34 @@ mod tests {
         superblock[40..44].copy_from_slice(&0u32.to_be_bytes());
         superblock[36..40].copy_from_slice(&1u32.to_be_bytes());
         assert!(validate_inspected_journal_features(&superblock).is_err());
+
+        superblock[36..40].copy_from_slice(&0u32.to_be_bytes());
+        superblock[40..44].copy_from_slice(&JBD2_FEATURE_INCOMPAT_CSUM_V2.to_be_bytes());
+        assert!(validate_inspected_journal_features(&superblock).is_err());
+        superblock[40..44].copy_from_slice(&0u32.to_be_bytes());
+        superblock[44..48].copy_from_slice(&1u32.to_be_bytes());
+        assert!(validate_inspected_journal_features(&superblock).is_err());
+    }
+
+    #[test]
+    fn validates_jbd2_v3_superblock_crc_and_geometry() {
+        let mut block = vec![0u8; 4096];
+        block[0..4].copy_from_slice(&JBD2_MAGIC_NUMBER.to_be_bytes());
+        block[4..8].copy_from_slice(&4u32.to_be_bytes());
+        block[8..12].copy_from_slice(&1u32.to_be_bytes());
+        block[12..16].copy_from_slice(&4096u32.to_be_bytes());
+        block[16..20].copy_from_slice(&1024u32.to_be_bytes());
+        block[20..24].copy_from_slice(&1u32.to_be_bytes());
+        block[40..44].copy_from_slice(&JBD2_FEATURE_INCOMPAT_CSUM_V3.to_be_bytes());
+        block[80] = 4;
+        let checksum = crc32c_kernel(!0, &block[..1024]);
+        block[0xfc..0x100].copy_from_slice(&checksum.to_be_bytes());
+
+        assert!(validate_journal_superblock_integrity(&block, 4096).is_ok());
+        let mut corrupt = block.clone();
+        corrupt[48] ^= 1;
+        assert!(validate_journal_superblock_integrity(&corrupt, 4096).is_err());
+        assert!(validate_journal_superblock_integrity(&block, 2048).is_err());
     }
 
     #[test]

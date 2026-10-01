@@ -647,12 +647,18 @@ impl Ext4Extent {
     }
 
     pub fn is_unwritten(&self) -> bool {
-        (u16::from_le(self.ee_len) & 0x8000) != 0
+        // ext4 encodes initialized lengths through 0x8000 inclusive. Values
+        // strictly greater than EXT_INIT_MAX_LEN carry the unwritten flag.
+        u16::from_le(self.ee_len) > 0x8000
     }
 
     pub fn block_count(&self) -> u32 {
         let len = u16::from_le(self.ee_len);
-        (len & 0x7FFF) as u32
+        if len > 0x8000 {
+            (len - 0x8000) as u32
+        } else {
+            len as u32
+        }
     }
 }
 
@@ -728,5 +734,17 @@ mod tests {
         };
         assert!(ext.is_unwritten());
         assert_eq!(ext.block_count(), 25);
+    }
+
+    #[test]
+    fn extent_length_boundary_0x8000_is_initialized() {
+        let ext = Ext4Extent {
+            ee_block: 0,
+            ee_len: 0x8000u16.to_le(),
+            ee_start_hi: 0,
+            ee_start_lo: 1u32.to_le(),
+        };
+        assert!(!ext.is_unwritten());
+        assert_eq!(ext.block_count(), 0x8000);
     }
 }

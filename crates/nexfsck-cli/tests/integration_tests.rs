@@ -828,6 +828,56 @@ fn test_real_ext4_inode_checksum_corruption_matches_e2fsprogs() {
 }
 
 #[test]
+fn test_backup_superblocks_are_checked_and_checksum_corruption_blocks_clean() {
+    let clean = unique_test_path("backup-clean.img");
+    let corrupt = unique_test_path("backup-corrupt.img");
+    for path in [&clean, &corrupt] {
+        assert!(
+            !path.exists(),
+            "refusing to overwrite test image {}",
+            path.display()
+        );
+    }
+    assert!(Command::new("truncate")
+        .args(["-s", "512M", clean.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-O", "metadata_csum", clean.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+
+    let (status, clean_json) = run_nexfsck_json(&clean);
+    assert_eq!(status, 0, "{clean_json}");
+    assert!(clean_json.contains("\"backup_superblocks_checked\": 2"));
+    assert!(clean_json.contains("\"backup_superblocks_invalid_checksum\": 0"));
+    assert!(clean_json.contains("\"backup_superblocks_inconsistent\": 0"));
+
+    std::fs::copy(&clean, &corrupt).unwrap();
+    // Default 4 KiB ext4 geometry places group 1 at block 32768. The backup
+    // superblock checksum is at byte 1020 within its 1024-byte structure.
+    flip_image_byte(&corrupt, 32_768 * 4096 + 1020);
+    let (status, corrupt_json) = run_nexfsck_json(&corrupt);
+    assert_eq!(status, 4, "{corrupt_json}");
+    assert!(corrupt_json.contains("\"backup_superblocks_invalid_checksum\": 1"));
+    assert!(corrupt_json.contains("\"repair_eligible\": false"));
+
+    let e2 = Command::new("e2fsck")
+        .args(["-f", "-n", corrupt.to_str().unwrap()])
+        .output()
+        .unwrap();
+    eprintln!(
+        "backup-superblock differential: nexfsck=4, e2fsck={}, diagnostic={}",
+        e2.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&e2.stderr)
+    );
+    std::fs::remove_file(clean).unwrap();
+    std::fs::remove_file(corrupt).unwrap();
+}
+
+#[test]
 fn test_clean_ext4_image_verification() {
     let img_path = "/tmp/test_clean_unique.img";
     let _ = std::fs::remove_file(img_path);

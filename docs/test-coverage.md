@@ -25,6 +25,7 @@ This inventory reflects the automated tests currently in the repository. It is d
 | No checksum-driven repair when metadata integrity is uncertain | `test_external_extent_block_checksum_corruption_oracle` |
 | Unsupported feature fail-closed behavior | `test_unsupported_feature_fails_closed` |
 | Real MMP feature is refused before verification without asserting owner safety | `test_mmp_filesystem_is_rejected_before_verification` |
+| Expected backup superblocks are checked and checksum corruption blocks clean/repair | `test_backup_superblocks_are_checked_and_checksum_corruption_blocks_clean` |
 | Orphan-file semantics and unknown incompat/RO-compat bits fail closed with valid superblock checksum | `test_unknown_incompat_and_ro_compat_bits_fail_closed` |
 | H-Tree root/leaf validation and child bounds | `validates_minimal_htree_root_and_leaf`, `rejects_out_of_bounds_htree_child` |
 | CUDA/CPU collision equivalence; CUDA required with env flag | `collision_detection_is_deterministic` |

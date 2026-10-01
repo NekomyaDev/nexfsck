@@ -45,7 +45,7 @@ Click the preview to open the [MP4 video](assets/benchmark_live.mp4). Full measu
 
 ### Integrity coverage
 
-The metadata checksum coverage and ext4 feature compatibility matrix are in [`docs/ext4-integrity-coverage.md`](docs/ext4-integrity-coverage.md). Implemented checksum validation covers superblocks, group descriptors, allocation bitmaps, inodes, directories/HTrees, external extent-tree blocks, and external xattr blocks. Xattr semantic hashes/refcount accounting, MMP, and full JBD2 metadata checksums remain partial or rejected; unsupported feature combinations fail closed. Earlier inode/extent workload measurements in [`docs/hot-path-optimization.md`](docs/hot-path-optimization.md) predate the current integrity changes and are marked historical; updated per-workload fixtures remain outstanding.
+The metadata integrity coverage and ext4 feature compatibility matrix are in [`docs/ext4-integrity-coverage.md`](docs/ext4-integrity-coverage.md). Implemented checks include primary and expected backup superblocks, group descriptors, allocation bitmaps, inodes, directories/HTrees, external extent-tree blocks, external xattr blocks, and the JBD2 superblock. Nexfsck still explicitly rejects MMP filesystems; xattr semantic hashes/shared refcounts and complete JBD2 transaction checksum traversal are incomplete. The machine-readable differential runner currently covers six metadata mutations and lists unimplemented cases in its report. Unsupported feature combinations fail closed. Earlier inode/extent workload measurements in [`docs/hot-path-optimization.md`](docs/hot-path-optimization.md) are historical; refreshed inode-, extent-, directory-, and xattr-specific runs remain outstanding.
 
 ## Workspace architecture
 
