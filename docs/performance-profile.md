@@ -108,17 +108,17 @@ evidence that fusion can never help larger fixtures.
 The preceding benchmark revision measured e2fsck at 0.127931 s and adaptive
 nexfsck at 0.118554 s median (1.08x on that fixture only), with 36.86–37.49 MiB
 RSS. On checksum-coverage implementation commit
-`893c92771d0b5340c250be8b3ac20ab8f63458ba`, the 10 GiB rerun measured e2fsck
-at 125.043 ms and nexfsck at 54.407 ms median (p95 130.033 / 56.398 ms,
-population standard deviation 2.287 / 0.762 ms). The profile attributed 5.787
-ms to inode CRC32c and 1.061 ms to directory checksums; additional superblock,
-group descriptor and bitmap checksum validation measured below timer resolution
-or below 0.02 ms in aggregate. Allocated blocks matched at 1,182,241; e2fsck's
-total inode count exceeded nexfsck's active count by seven reserved inodes.
-Nexfsck reported zero errors, completed all 30 endurance passes, and passed
-corruption detection, repair, post-repair verification, rollback, and restored
-corruption detection. RSS ranged from 36.37 to 36.62 MiB. The raw run is
-published in `benchmark-results/latest.json` with the exact source revision.
+`c850dc49623f5791d93b8ede469ec2bcf0ae9105`, the 10 GiB rerun measured e2fsck
+at 125.315 ms and nexfsck at 53.635 ms median (p95 127.450 / 55.171 ms,
+population standard deviation 1.039 / 0.809 ms). The profile attributed 6.393
+ms to inode CRC32c and 0.961 ms to directory checksums; superblock, group
+descriptor and bitmap checksum validation measured at or below 0.02 ms each.
+Allocated blocks matched at 1,182,238; e2fsck's total inode count exceeded
+nexfsck's active count by seven reserved inodes. Nexfsck reported zero errors,
+completed all 30 endurance passes, and passed corruption detection, repair,
+post-repair verification, rollback, and restored-corruption detection. RSS
+ranged from 36.49 to 36.62 MiB. The raw run is published in
+`benchmark-results/latest.json` with the exact source revision.
 
 This does not establish a physical-storage crossover or general superiority over
 e2fsck. Larger inode-heavy and extent-heavy disk fixtures remain future benchmark
