@@ -27,9 +27,11 @@ The GPU probe and CPU feature detection must not be interpreted as evidence that
 
 ## Benchmark policy
 
-The historical 1 GiB `0.28 s` versus `0.02 s` result and its `14x`, RTX 4060, and “100% bit-exact” descriptions are not presented as project results because the repository does not contain enough evidence to reproduce or attribute them. Matching aggregate inode/block counts is useful, but it is not a bit-for-bit comparison of filesystem state or repair output.
+Published benchmark results must be reproducible from a committed source revision. The result artifact records that source commit separately from the later commit that publishes the artifact; it also retains every timed sample, median, p95, standard deviation, fixture parameters, tool versions, and cache policy. External process wall time is the headline timing; internal phase timings are diagnostic only.
 
-New performance claims must include the fixture-generation command, CPU, RAM, storage, kernel, tool versions and flags, cache policy, thread count, active I/O backend, sample count, and variance. GPU acceleration may only be claimed when a compute backend exists and the benchmark records that it executed. See [`docs/benchmarking.md`](docs/benchmarking.md).
+Comparisons must use the same fixture and cache policy, report the exact commands and environment, and identify whether storage is tmpfs or physical media. Sparse logical image size must not be described as bytes physically read. A benchmark may report aggregate counter parity, but that is not allocation-set, diagnostic, repair, or byte-for-byte parity. GPU or SIMD execution may only be claimed when the run records that the relevant backend actually executed. Do not omit startup, failed runs, or slower backend cases from a comparison. See [`docs/benchmarking.md`](docs/benchmarking.md) and the archived [raw benchmark result](benchmark-results/latest.json).
+
+Historical claims that lack fixture, source, and execution-path provenance—including the old 1 GiB `14x`/RTX 4060/“100% bit-exact” result—are not current project results. The current 10 GiB video is a demonstration, not a substitute for the machine-readable measurements and their stated limitations below.
 
 ### Benchmark video
 
@@ -43,7 +45,7 @@ Click the preview to open the [MP4 video](assets/benchmark_live.mp4). Full measu
 
 ### Integrity coverage
 
-The metadata checksum coverage and ext4 feature compatibility matrix are in [`docs/ext4-integrity-coverage.md`](docs/ext4-integrity-coverage.md). Implemented checksum validation covers superblocks, group descriptors, allocation bitmaps, inodes, directories/HTrees, and external extent-tree blocks. MMP, xattr, JBD2 full-metadata, and other listed gaps remain explicitly partial or rejected; filesystems carrying features nexfsck cannot safely validate are rejected. Allocation, bitmap, directory, thread-scaling, and additional-workload results are documented in [`docs/hot-path-optimization.md`](docs/hot-path-optimization.md).
+The metadata checksum coverage and ext4 feature compatibility matrix are in [`docs/ext4-integrity-coverage.md`](docs/ext4-integrity-coverage.md). Implemented checksum validation covers superblocks, group descriptors, allocation bitmaps, inodes, directories/HTrees, external extent-tree blocks, and external xattr blocks. Xattr semantic hashes/refcount accounting, MMP, and full JBD2 metadata checksums remain partial or rejected; unsupported feature combinations fail closed. Allocation, bitmap, directory, thread-scaling, and additional-workload results are documented in [`docs/hot-path-optimization.md`](docs/hot-path-optimization.md).
 
 ## Workspace architecture
 

@@ -467,6 +467,13 @@ pub struct Ext4Inode {
 }
 
 impl Ext4Inode {
+    /// Physical block holding this inode's external extended attributes, if any.
+    pub fn external_xattr_block(&self) -> u64 {
+        let low = u32::from_le(self.i_file_acl_lo) as u64;
+        let high = u16::from_le_bytes([self.osd2[2], self.osd2[3]]) as u64;
+        (high << 32) | low
+    }
+
     pub fn mode(&self) -> u16 {
         u16::from_le(self.i_mode)
     }

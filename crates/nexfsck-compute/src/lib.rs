@@ -20,6 +20,18 @@ use nexfsck_core::{
 
 const EXT4_SUPERBLOCK_CSUM_OFFSET: usize = 1020;
 const EXT4_GROUP_DESC_CSUM_OFFSET: usize = 30;
+const EXT4_XATTR_MAGIC: u32 = 0xea02_0000;
+const EXT4_XATTR_HEADER_SIZE: usize = 32;
+const EXT4_XATTR_ENTRY_HEADER_SIZE: usize = 16;
+const EXT4_XATTR_REFCOUNT_MAX: u32 = 1024;
+const EXT4_XATTR_VALUE_MAX: usize = 1 << 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XattrBlockValidation {
+    Valid { refcount: u32 },
+    InvalidStructure,
+    InvalidChecksum,
+}
 
 /// Common filesystem checksum state. Each verifier below follows the ext4
 /// structure-specific byte coverage rules; this type only shares the seed.
@@ -218,6 +230,107 @@ impl Ext4MetadataChecksum {
         crc = ext4_crc32c(crc, &generation.to_le_bytes());
         crc = ext4_crc32c(crc, &block[..tail]);
         provided == crc
+    }
+
+    /// Validate an external ext4 xattr block and its metadata checksum.
+    /// Xattr inode values are rejected by feature policy before this parser is used.
+    pub fn validate_xattr_block(&self, block_number: u64, block: &[u8]) -> XattrBlockValidation {
+        if block.len() < EXT4_XATTR_HEADER_SIZE + 4
+            || u32::from_le_bytes(block[0..4].try_into().unwrap()) != EXT4_XATTR_MAGIC
+        {
+            return XattrBlockValidation::InvalidStructure;
+        }
+        let refcount = u32::from_le_bytes(block[4..8].try_into().unwrap());
+        let blocks = u32::from_le_bytes(block[8..12].try_into().unwrap());
+        if !(1..=EXT4_XATTR_REFCOUNT_MAX).contains(&refcount)
+            || blocks != 1
+            || block[20..EXT4_XATTR_HEADER_SIZE]
+                .iter()
+                .any(|byte| *byte != 0)
+        {
+            return XattrBlockValidation::InvalidStructure;
+        }
+
+        let mut cursor = EXT4_XATTR_HEADER_SIZE;
+        let entries_end = loop {
+            let Some(prefix) = block.get(cursor..cursor.saturating_add(4)) else {
+                return XattrBlockValidation::InvalidStructure;
+            };
+            if prefix.iter().all(|byte| *byte == 0) {
+                break cursor + 4;
+            }
+            let Some(entry_header) =
+                block.get(cursor..cursor.saturating_add(EXT4_XATTR_ENTRY_HEADER_SIZE))
+            else {
+                return XattrBlockValidation::InvalidStructure;
+            };
+            let name_len = entry_header[0] as usize;
+            let name_index = entry_header[1];
+            let value_offset = u16::from_le_bytes(entry_header[2..4].try_into().unwrap()) as usize;
+            let value_inode = u32::from_le_bytes(entry_header[4..8].try_into().unwrap());
+            let value_size = u32::from_le_bytes(entry_header[8..12].try_into().unwrap()) as usize;
+            let entry_len = (EXT4_XATTR_ENTRY_HEADER_SIZE + name_len + 3) & !3;
+            let Some(entry) = block.get(cursor..cursor.saturating_add(entry_len)) else {
+                return XattrBlockValidation::InvalidStructure;
+            };
+            if !(1..=10).contains(&name_index)
+                || entry[EXT4_XATTR_ENTRY_HEADER_SIZE..]
+                    .iter()
+                    .take(name_len)
+                    .any(|byte| *byte == 0)
+                || value_size > EXT4_XATTR_VALUE_MAX
+                || value_inode != 0
+            {
+                return XattrBlockValidation::InvalidStructure;
+            }
+            if value_size != 0 {
+                let padded_size = value_size.checked_add(3).map(|size| size & !3);
+                let Some(padded_size) = padded_size else {
+                    return XattrBlockValidation::InvalidStructure;
+                };
+                if value_offset & 3 != 0
+                    || value_offset < cursor.saturating_add(entry_len).saturating_add(4)
+                    || value_offset
+                        .checked_add(padded_size)
+                        .is_none_or(|end| end > block.len())
+                {
+                    return XattrBlockValidation::InvalidStructure;
+                }
+            }
+            cursor += entry_len;
+        };
+
+        // Reject values that point into the entry-list terminator or any
+        // name/header byte. Individual value extents are validated above.
+        let mut cursor = EXT4_XATTR_HEADER_SIZE;
+        while cursor + 4 <= entries_end - 4 {
+            let name_len = block[cursor] as usize;
+            let value_offset =
+                u16::from_le_bytes(block[cursor + 2..cursor + 4].try_into().unwrap()) as usize;
+            let value_inode = u32::from_le_bytes(block[cursor + 4..cursor + 8].try_into().unwrap());
+            let value_size =
+                u32::from_le_bytes(block[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
+            let entry_len = (EXT4_XATTR_ENTRY_HEADER_SIZE + name_len + 3) & !3;
+            if value_size != 0 && value_inode == 0 && value_offset < entries_end {
+                return XattrBlockValidation::InvalidStructure;
+            }
+            cursor += entry_len;
+        }
+
+        if self.enabled {
+            if !self.crc32c_supported {
+                return XattrBlockValidation::InvalidChecksum;
+            }
+            let provided = u32::from_le_bytes(block[16..20].try_into().unwrap());
+            let mut crc = ext4_crc32c(self.seed, &block_number.to_le_bytes());
+            crc = ext4_crc32c(crc, &block[..16]);
+            crc = ext4_crc32c(crc, &[0; 4]);
+            crc = ext4_crc32c(crc, &block[20..]);
+            if provided != crc {
+                return XattrBlockValidation::InvalidChecksum;
+            }
+        }
+        XattrBlockValidation::Valid { refcount }
     }
 
     pub fn verify_bitmap(&self, _group: u32, bitmap: &[u8], provided: u32, has_high: bool) -> bool {
@@ -574,6 +687,34 @@ mod crc_tests {
         (crc, has_high)
     }
 
+    fn install_xattr_checksum(sb: &Ext4Superblock, block_number: u64, block: &mut [u8]) {
+        let seed = if sb.has_incompat_feature(EXT4_FEATURE_INCOMPAT_CSUM_SEED) {
+            u32::from_le(sb.s_checksum_seed)
+        } else {
+            ext4_crc32c(u32::MAX, &sb.s_uuid)
+        };
+        let mut crc = ext4_crc32c(seed, &block_number.to_le_bytes());
+        crc = ext4_crc32c(crc, &block[..16]);
+        crc = ext4_crc32c(crc, &[0; 4]);
+        crc = ext4_crc32c(crc, &block[20..]);
+        block[16..20].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    fn valid_xattr_block(sb: &Ext4Superblock, block_number: u64) -> Vec<u8> {
+        let mut block = vec![0u8; 4096];
+        block[0..4].copy_from_slice(&EXT4_XATTR_MAGIC.to_le_bytes());
+        block[4..8].copy_from_slice(&1u32.to_le_bytes());
+        block[8..12].copy_from_slice(&1u32.to_le_bytes());
+        block[32] = 1;
+        block[33] = 1;
+        block[34..36].copy_from_slice(&4088u16.to_le_bytes());
+        block[40..44].copy_from_slice(&4u32.to_le_bytes());
+        block[48] = b'a';
+        block[4088..4092].copy_from_slice(b"data");
+        install_xattr_checksum(sb, block_number, &mut block);
+        block
+    }
+
     fn install_inode_checksum(superblock: &Ext4Superblock, inode_number: u32, raw: &mut [u8]) {
         let (checksum, has_high) = reference_inode_checksum(superblock, inode_number, raw);
         raw[INODE_CHECKSUM_LO_OFFSET..INODE_CHECKSUM_LO_OFFSET + 2]
@@ -684,6 +825,56 @@ mod crc_tests {
             InodeChecksumResult::Valid
         );
     }
+
+    #[test]
+    fn external_xattr_checksum_and_bounds_are_deterministic() {
+        let mut sb = test_superblock(256, Some(0xfeed_beef));
+        sb.s_checksum_type = 1;
+        let verifier = Ext4MetadataChecksum::new(&sb);
+        let block_number = 0x1_2345_6789;
+        let clean = valid_xattr_block(&sb, block_number);
+        assert_eq!(
+            verifier.validate_xattr_block(block_number, &clean),
+            XattrBlockValidation::Valid { refcount: 1 }
+        );
+
+        let mut bad_header = clean.clone();
+        bad_header[0] ^= 1;
+        assert_eq!(
+            verifier.validate_xattr_block(block_number, &bad_header),
+            XattrBlockValidation::InvalidStructure
+        );
+        let mut bad_bounds = clean.clone();
+        bad_bounds[34..36].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            verifier.validate_xattr_block(block_number, &bad_bounds),
+            XattrBlockValidation::InvalidStructure
+        );
+        let mut bad_checksum = clean.clone();
+        bad_checksum[16] ^= 1;
+        assert_eq!(
+            verifier.validate_xattr_block(block_number, &bad_checksum),
+            XattrBlockValidation::InvalidChecksum
+        );
+        assert_eq!(
+            verifier.validate_xattr_block(block_number + 1, &clean),
+            XattrBlockValidation::InvalidChecksum
+        );
+
+        let mut seed = 0x4d4d_5058_4154_5452u64;
+        for length in 0..=512 {
+            let mut arbitrary = vec![0u8; length];
+            for byte in &mut arbitrary {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *byte = seed as u8;
+            }
+            let first = verifier.validate_xattr_block(block_number, &arbitrary);
+            let second = verifier.validate_xattr_block(block_number, &arbitrary);
+            assert_eq!(first, second, "nondeterministic result at len={length}");
+        }
+    }
 }
 
 /// Statistics collected during inode & extent verification.
@@ -710,6 +901,8 @@ pub struct InodeVerificationStats {
     pub inode_checksum_failures: AtomicU64,
     pub directory_checksum_failures: AtomicU64,
     pub extent_block_checksum_failures: AtomicU64,
+    pub xattr_block_corruptions: AtomicU64,
+    pub xattr_checksum_failures: AtomicU64,
 }
 
 #[derive(Clone, Copy)]

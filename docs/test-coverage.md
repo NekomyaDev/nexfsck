@@ -21,11 +21,14 @@ This inventory reflects the automated tests currently in the repository. It is d
 | Superblock, group descriptor, block/inode bitmap checksum corruption oracles | `test_metadata_checksum_corruption_oracle` |
 | Directory leaf and indexed HTree checksum corruption oracles | `test_directory_checksum_corruption_oracle`, `test_htree_checksum_corruption_oracle` |
 | External extent-node checksum clean/corruption oracle | `test_external_extent_block_checksum_corruption_oracle` |
+| External xattr clean/header/bounds/value/checksum/payload corruption oracle | `test_external_xattr_block_integrity_oracle` |
 | No checksum-driven repair when metadata integrity is uncertain | `test_external_extent_block_checksum_corruption_oracle` |
 | Unsupported feature fail-closed behavior | `test_unsupported_feature_fails_closed` |
+| Orphan-file semantics and unknown incompat/RO-compat bits fail closed with valid superblock checksum | `test_unknown_incompat_and_ro_compat_bits_fail_closed` |
 | H-Tree root/leaf validation and child bounds | `validates_minimal_htree_root_and_leaf`, `rejects_out_of_bounds_htree_child` |
 | CUDA/CPU collision equivalence; CUDA required with env flag | `collision_detection_is_deterministic` |
 | JBD2 committed, incomplete, revoked, checksum-v3, and 64-bit transactions | `plans_only_committed_jbd2_data`, `ignores_uncommitted_tail`, `revoke_removes_committed_write`, `validates_checksum_v3_and_64bit_target` |
+| JBD2 unknown incompat and unvalidated compat-checksum policy | `journal_feature_policy_rejects_unknown_and_unvalidated_checksum_modes` |
 | Interrupted JBD2 replay and durable pre-image rollback | `interrupted_replay_can_be_rolled_back_from_synced_preimages` |
 | Heatmap/rates and Prometheus format | `heatmap_and_rates_are_reported`, `prometheus_contains_all_counters` |
 | 64-bit chunk boundaries and high-block collision tracking | `tracks_ranges_across_the_32_bit_chunk_boundary`, `detects_collision_above_four_billion_blocks` |

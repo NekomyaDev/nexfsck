@@ -153,6 +153,23 @@ impl JournalFeatures {
     }
 }
 
+fn validate_inspected_journal_features(block: &[u8]) -> Result<JournalFeatures, JournalError> {
+    let features = JournalFeatures::from_superblock_bytes(block)?;
+    let compat = u32::from_be_bytes(
+        block
+            .get(36..40)
+            .ok_or_else(|| JournalError::CorruptLog("truncated JBD2 compat flags".into()))?
+            .try_into()
+            .unwrap(),
+    );
+    if compat & 0x1 != 0 {
+        return Err(JournalError::CorruptLog(
+            "JBD2 compat checksum metadata is not fully validated".into(),
+        ));
+    }
+    Ok(features)
+}
+
 /// Builds a replay plan from JBD2 log blocks. Only transactions with a matching
 /// commit record are returned; revoked and deleted blocks are excluded.
 /// Unsupported/truncated layouts fail closed instead of producing partial writes.
@@ -581,36 +598,85 @@ pub fn inspect_journal(
     is_64bit: bool,
 ) -> Result<Option<Jbd2Superblock>, JournalError> {
     let journal_inum = u32::from_le(sb.s_journal_inum);
-    if journal_inum == 0 || descriptors.is_empty() {
+    if journal_inum == 0 {
         return Ok(None);
     }
+    if descriptors.is_empty() {
+        return Err(JournalError::CorruptLog(
+            "journal inode is present but the filesystem has no group descriptors".into(),
+        ));
+    }
 
-    // Inode 8 is in block group 0
-    let desc0 = &descriptors[0];
+    let inodes_per_group = sb.inodes_per_group() as usize;
+    if inodes_per_group == 0 {
+        return Err(JournalError::CorruptLog(
+            "filesystem has zero inodes per group".into(),
+        ));
+    }
+    let journal_index = journal_inum.saturating_sub(1) as usize;
+    let group_index = journal_index / inodes_per_group;
+    let desc0 = descriptors.get(group_index).ok_or_else(|| {
+        JournalError::CorruptLog("journal inode is outside the group descriptor table".into())
+    })?;
+    let inode_size = sb.inode_size() as usize;
+    let idx = journal_index % inodes_per_group;
+    if inode_size < 64 {
+        return Err(JournalError::CorruptLog(
+            "journal inode has a truncated on-disk layout".into(),
+        ));
+    }
     let inode_table = dev.read_inode_table(sb, desc0, is_64bit)?;
-    let inodes = BlockDevice::parse_inodes_from_table(&inode_table, sb.inode_size() as usize);
-
-    let idx = (journal_inum - 1) as usize;
-    if idx >= inodes.len() {
-        return Ok(None);
+    let inode_start = idx
+        .checked_mul(inode_size)
+        .ok_or_else(|| JournalError::CorruptLog("journal inode offset overflow".into()))?;
+    let raw_inode = inode_table
+        .get(inode_start..inode_start + inode_size)
+        .ok_or_else(|| JournalError::CorruptLog("journal inode bytes are truncated".into()))?;
+    let mode = u16::from_le_bytes(raw_inode[0..2].try_into().unwrap());
+    let flags = u32::from_le_bytes(raw_inode[32..36].try_into().unwrap());
+    if mode == 0 || flags & nexfsck_core::EXT4_EXTENTS_FL == 0 {
+        return Err(JournalError::CorruptLog(
+            "journal inode is unused or does not use extent mapping".into(),
+        ));
     }
 
-    let journal_inode = &inodes[idx];
-    if !journal_inode.is_used() || !journal_inode.uses_extents() {
-        return Ok(None);
+    // JBD2 logical block zero is mapped by the first leaf extent. This compact
+    // path intentionally rejects deeper inode roots until their child path is
+    // independently validated; interpreting an index as a leaf is unsafe.
+    let root = &raw_inode[40..100];
+    let header = nexfsck_core::Ext4ExtentHeader::ref_from_prefix(root)
+        .map_err(|_| JournalError::CorruptLog("truncated journal extent root".into()))?
+        .0;
+    if !header.is_valid_magic()
+        || header.depth() != 0
+        || header.entries() == 0
+        || header.entries() > header.max()
+    {
+        return Err(JournalError::CorruptLog(
+            "journal extent root is malformed or requires unsupported traversal".into(),
+        ));
     }
-
-    if let Ok((ext, _)) = Ext4Extent::ref_from_prefix(&journal_inode.i_block[12..]) {
-        let first_block = ext.physical_start();
-        let block_bytes = dev.read_block(first_block, sb.block_size())?;
-        if let Ok((jbd_sb, _)) = Jbd2Superblock::ref_from_prefix(&block_bytes) {
-            if jbd_sb.verify_magic().is_ok() {
-                return Ok(Some(*jbd_sb));
-            }
-        }
+    let ext = Ext4Extent::ref_from_prefix(&root[12..])
+        .map_err(|_| JournalError::CorruptLog("truncated first journal extent".into()))?
+        .0;
+    if ext.logical_block() != 0 || ext.block_count() == 0 || ext.is_unwritten() {
+        return Err(JournalError::CorruptLog(
+            "first journal extent does not map logical block zero".into(),
+        ));
     }
-
-    Ok(None)
+    let first_block = ext.physical_start();
+    let extent_end = first_block.checked_add(ext.block_count() as u64);
+    if extent_end.is_none_or(|end| end > sb.total_blocks()) {
+        return Err(JournalError::CorruptLog(
+            "journal superblock extent points outside the filesystem".into(),
+        ));
+    }
+    let block_bytes = dev.read_block(first_block, sb.block_size())?;
+    let (jbd_sb, _) = Jbd2Superblock::ref_from_prefix(&block_bytes)
+        .map_err(|_| JournalError::CorruptLog("truncated JBD2 superblock".into()))?;
+    jbd_sb.verify_magic()?;
+    validate_inspected_journal_features(&block_bytes)?;
+    Ok(Some(*jbd_sb))
 }
 
 #[cfg(test)]
@@ -624,6 +690,20 @@ mod tests {
         block[4..8].copy_from_slice(&kind.to_be_bytes());
         block[8..12].copy_from_slice(&sequence.to_be_bytes());
         block
+    }
+
+    #[test]
+    fn journal_feature_policy_rejects_unknown_and_unvalidated_checksum_modes() {
+        let mut superblock = vec![0u8; 64];
+        superblock[40..44].copy_from_slice(&JBD2_FEATURE_INCOMPAT_CSUM_V3.to_be_bytes());
+        assert!(validate_inspected_journal_features(&superblock).is_ok());
+
+        superblock[40..44].copy_from_slice(&0x8000_0000u32.to_be_bytes());
+        assert!(validate_inspected_journal_features(&superblock).is_err());
+
+        superblock[40..44].copy_from_slice(&0u32.to_be_bytes());
+        superblock[36..40].copy_from_slice(&1u32.to_be_bytes());
+        assert!(validate_inspected_journal_features(&superblock).is_err());
     }
 
     #[test]

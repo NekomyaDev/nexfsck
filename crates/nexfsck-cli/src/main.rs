@@ -1,6 +1,7 @@
 //! `nexfsck` — experimental ext4 file system checker
 
 use clap::{Parser, ValueEnum};
+use std::collections::HashSet;
 use std::os::unix::fs::FileTypeExt;
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
@@ -14,7 +15,7 @@ use nexfsck_compute::{
     reconcile_inode_bitmap, verify_directory_block_compact, verify_htree_directory,
     verify_inodes_parallel, BitmapDiscrepancy, BlockAllocationTracker, Ext4MetadataChecksum,
     HardwareProfile, InodeBitmapDiscrepancy, InodeChecksumResult, InodeChecksumVerifier,
-    InodeVerificationStats,
+    InodeVerificationStats, XattrBlockValidation,
 };
 use nexfsck_gpu::{BlockInterval, GpuAccelerator};
 use nexfsck_io::{BlockDevice, IoBackend};
@@ -155,6 +156,11 @@ fn unsupported_ext4_feature(sb: &nexfsck_core::Ext4Superblock) -> Option<&'stati
     if sb.desc_size() > 64 {
         return Some("group descriptors larger than 64 bytes");
     }
+    // Compat bits may be ignored by a generic ext4 reader, but orphan_file
+    // changes inode-recovery semantics that this checker does not validate.
+    if sb.has_compat_feature(EXT4_FEATURE_COMPAT_ORPHAN_FILE) {
+        return Some("orphan_file metadata");
+    }
     let incompat = u32::from_le(sb.s_feature_incompat);
     let incompat_known = EXT4_FEATURE_INCOMPAT_FILETYPE
         | EXT4_FEATURE_INCOMPAT_RECOVER
@@ -216,6 +222,23 @@ fn unsupported_ext4_feature(sb: &nexfsck_core::Ext4Superblock) -> Option<&'stati
         return Some("orphan_file");
     }
     None
+}
+
+#[derive(Debug, Default)]
+struct RepairTrustState {
+    blocked_reasons: Vec<&'static str>,
+}
+
+impl RepairTrustState {
+    fn block(&mut self, reason: &'static str) {
+        if !self.blocked_reasons.contains(&reason) {
+            self.blocked_reasons.push(reason);
+        }
+    }
+
+    fn is_eligible(&self) -> bool {
+        self.blocked_reasons.is_empty()
+    }
 }
 
 fn main() -> ExitCode {
@@ -476,21 +499,29 @@ fn main() -> ExitCode {
 
     // JBD2 Crash Recovery Journal Inspection
     let mut journal_is_dirty = false;
-    if let Ok(Some(jbd)) = nexfsck_journal::inspect_journal(&dev, &sb, &group_descriptors, is_64bit)
-    {
-        let is_dirty =
-            !jbd.is_clean() || sb.has_incompat_feature(nexfsck_core::EXT4_FEATURE_INCOMPAT_RECOVER);
-        journal_is_dirty = is_dirty;
-        if !args.json {
-            info!(
-                "JBD2 Journal Active | Seq: {} | Block Size: {}B | Clean: {}",
-                jbd.sequence(),
-                jbd.block_size(),
-                !is_dirty
-            );
+    let mut journal_integrity_failures = 0u64;
+    match nexfsck_journal::inspect_journal(&dev, &sb, &group_descriptors, is_64bit) {
+        Ok(Some(jbd)) => {
+            let is_dirty = !jbd.is_clean()
+                || sb.has_incompat_feature(nexfsck_core::EXT4_FEATURE_INCOMPAT_RECOVER);
+            journal_is_dirty = is_dirty;
+            if !args.json {
+                info!(
+                    "JBD2 Journal Active | Seq: {} | Block Size: {}B | Clean: {}",
+                    jbd.sequence(),
+                    jbd.block_size(),
+                    !is_dirty
+                );
+            }
+            if is_dirty {
+                warn!("Filesystem journal is DIRTY: uncommitted or pending transactions exist.");
+            }
         }
-        if is_dirty {
-            warn!("Filesystem journal is DIRTY: uncommitted or pending transactions exist.");
+        Ok(None) => {}
+        Err(error) => {
+            journal_is_dirty = true;
+            journal_integrity_failures = 1;
+            error!("JBD2 journal integrity could not be established: {}", error);
         }
     }
     profile.mark("journal_inspection");
@@ -554,6 +585,9 @@ fn main() -> ExitCode {
     let mut inode_checksum_time = Duration::ZERO;
     let mut inactive_inode_count = 0u64;
     let inode_checksum_verifier = InodeChecksumVerifier::new(&sb);
+    let mut invalid_inode_checksums = HashSet::new();
+    let mut seen_xattr_blocks = HashSet::new();
+    let mut xattr_validation_time = Duration::ZERO;
 
     for (bg_idx, desc) in group_descriptors.iter().enumerate() {
         let free_inodes = desc.free_inodes_count(is_64bit);
@@ -586,6 +620,7 @@ fn main() -> ExitCode {
                         inode_checksum_verifier.verify(first_inode + index as u32, raw_inode),
                         InodeChecksumResult::Invalid { .. }
                     ) {
+                        invalid_inode_checksums.insert(first_inode + index as u32);
                         inode_stats
                             .inode_checksum_failures
                             .fetch_add(1, Ordering::Relaxed);
@@ -603,6 +638,48 @@ fn main() -> ExitCode {
                 for (i, inode) in inodes.iter().enumerate() {
                     let ino_num = (bg_idx as u32) * sb.inodes_per_group() + (i as u32) + 1;
                     let generation = u32::from_le(inode.i_generation);
+                    let xattr_block = inode.external_xattr_block();
+                    if inode.is_used()
+                        && !invalid_inode_checksums.contains(&ino_num)
+                        && xattr_block != 0
+                        && seen_xattr_blocks.insert(xattr_block)
+                    {
+                        if xattr_block >= total_blocks {
+                            inode_stats
+                                .xattr_block_corruptions
+                                .fetch_add(1, Ordering::Relaxed);
+                            group_had_error = true;
+                        } else {
+                            tracker.mark_range(xattr_block, 1);
+                            let started = Instant::now();
+                            match dev.read_block(xattr_block, block_size) {
+                                Ok(bytes) => match metadata_checksum
+                                    .validate_xattr_block(xattr_block, &bytes)
+                                {
+                                    XattrBlockValidation::Valid { .. } => {}
+                                    XattrBlockValidation::InvalidStructure => {
+                                        inode_stats
+                                            .xattr_block_corruptions
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        group_had_error = true;
+                                    }
+                                    XattrBlockValidation::InvalidChecksum => {
+                                        inode_stats
+                                            .xattr_checksum_failures
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        group_had_error = true;
+                                    }
+                                },
+                                Err(_) => {
+                                    inode_stats
+                                        .xattr_block_corruptions
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    group_had_error = true;
+                                }
+                            }
+                            xattr_validation_time += started.elapsed();
+                        }
+                    }
                     if inode.is_used() && inode.is_dir() {
                         inode_generations.insert(ino_num, generation);
                         let blocks = collect_directory_blocks(inode, &|blk| {
@@ -659,6 +736,7 @@ fn main() -> ExitCode {
     profile.record("inode_table_reads", inode_table_read_time);
     profile.record("inode_decoding", inode_decode_time);
     profile.record("inode_checksum_total", inode_checksum_time);
+    profile.record("xattr_block_reads_validation", xattr_validation_time);
     profile.record(
         "inode_metadata_extent_collection",
         inode_metadata_collection_time,
@@ -1012,11 +1090,38 @@ fn main() -> ExitCode {
     let extent_block_checksum_failures = inode_stats
         .extent_block_checksum_failures
         .load(Ordering::Relaxed);
+    let xattr_block_corruptions = inode_stats.xattr_block_corruptions.load(Ordering::Relaxed);
+    let xattr_checksum_failures = inode_stats.xattr_checksum_failures.load(Ordering::Relaxed);
     let checksum_failures = inode_checksum_failures
         + block_bitmap_checksum_failures
         + inode_bitmap_checksum_failures
         + directory_checksum_failures
-        + extent_block_checksum_failures;
+        + extent_block_checksum_failures
+        + xattr_checksum_failures;
+    let media_errors = dev.media_errors();
+
+    // Repair trust is deliberately stricter than read-only reporting. A
+    // bitmap discrepancy is repairable only when the metadata used to
+    // reconstruct it is independently trustworthy.
+    let mut repair_trust = RepairTrustState::default();
+    if checksum_failures != 0 {
+        repair_trust.block("metadata checksum failure");
+    }
+    if corruptions + duplicates + oob != 0 {
+        repair_trust.block("inode or extent structure is invalid");
+    }
+    if xattr_block_corruptions != 0 {
+        repair_trust.block("external xattr structure or read is invalid");
+    }
+    if corrupt_symlinks + corrupt_dirs + orphan_dirs + link_mismatches != 0 {
+        repair_trust.block("directory, symlink, or reference validation failed");
+    }
+    if journal_is_dirty {
+        repair_trust.block("journal state is dirty or journal integrity is uncertain");
+    }
+    if media_errors != 0 {
+        repair_trust.block("storage read reported media errors");
+    }
 
     stats.errors_found += corruptions
         + duplicates
@@ -1030,16 +1135,22 @@ fn main() -> ExitCode {
         + inode_bitmap_checksum_failures
         + directory_checksum_failures
         + extent_block_checksum_failures
+        + xattr_block_corruptions
+        + xattr_checksum_failures
+        + journal_integrity_failures
         + total_block_discrepancy.false_free_blocks
         + total_inode_discrepancy.false_free_inodes
-        + dev.media_errors();
+        + media_errors;
 
     // 6. Active Repair Mode Execution
     let mut errors_were_corrected = false;
     let has_repairable_errors = total_block_discrepancy.false_free_blocks > 0
         || total_inode_discrepancy.false_free_inodes > 0;
-    if args.repair && has_repairable_errors && checksum_failures != 0 {
-        error!("Checksum failures leave metadata integrity unknown; refusing all bitmap repair");
+    if args.repair && has_repairable_errors && !repair_trust.is_eligible() {
+        error!(
+            "Repair blocked by trust policy: {}",
+            repair_trust.blocked_reasons.join("; ")
+        );
     } else if args.repair && has_repairable_errors {
         info!("Active Repair Mode: Correcting false-free bitmaps with a flushed pre-image undo journal...");
         if let Ok(mut undo_journal) =
@@ -1229,6 +1340,14 @@ fn main() -> ExitCode {
             "  \"extent_block_checksum_failures\": {},",
             extent_block_checksum_failures
         );
+        println!(
+            "  \"xattr_block_corruptions\": {},",
+            xattr_block_corruptions
+        );
+        println!(
+            "  \"xattr_checksum_failures\": {},",
+            xattr_checksum_failures
+        );
         println!("  \"extent_corruptions\": {},", corruptions);
         println!("  \"duplicate_blocks\": {},", duplicates);
         println!("  \"out_of_bounds_blocks\": {},", oob);
@@ -1249,8 +1368,22 @@ fn main() -> ExitCode {
             total_inode_discrepancy.leaked_inodes
         );
         println!("  \"journal_dirty\": {},", journal_is_dirty);
+        println!(
+            "  \"journal_integrity_failures\": {},",
+            journal_integrity_failures
+        );
         println!("  \"errors_detected\": {},", stats.errors_found);
         println!("  \"errors_corrected\": {},", errors_were_corrected);
+        println!("  \"repair_eligible\": {},", repair_trust.is_eligible());
+        println!(
+            "  \"repair_blocked_reasons\": [{}],",
+            repair_trust
+                .blocked_reasons
+                .iter()
+                .map(|reason| format!("\"{reason}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         println!("  \"elapsed_seconds\": {:.4}", stats.elapsed_secs());
         println!("}}");
     } else {
@@ -1316,6 +1449,12 @@ fn main() -> ExitCode {
             total_inode_discrepancy.leaked_inodes
         );
         println!("Journal Dirty      : {}", journal_is_dirty);
+        if !repair_trust.is_eligible() {
+            println!(
+                "Repair Blocked     : {}",
+                repair_trust.blocked_reasons.join("; ")
+            );
+        }
         println!("--------------------------------------------------");
 
         if errors_were_corrected {

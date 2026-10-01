@@ -1,3 +1,4 @@
+use nexfsck_compute::ext4_crc32c;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -53,6 +54,35 @@ fn flip_image_byte(image: &Path, byte_offset: u64) {
     byte[0] ^= 0x01;
     file.seek(SeekFrom::Start(byte_offset)).unwrap();
     file.write_all(&byte).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn set_image_bytes(image: &Path, byte_offset: u64, bytes: &[u8]) {
+    let mut file = OpenOptions::new().write(true).open(image).unwrap();
+    file.seek(SeekFrom::Start(byte_offset)).unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn set_superblock_feature_bit(image: &Path, feature_offset: usize, bit: u32) {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image)
+        .unwrap();
+    let mut superblock = [0u8; 1024];
+    file.seek(SeekFrom::Start(1024)).unwrap();
+    file.read_exact(&mut superblock).unwrap();
+    let value = u32::from_le_bytes(
+        superblock[feature_offset..feature_offset + 4]
+            .try_into()
+            .unwrap(),
+    ) | bit;
+    superblock[feature_offset..feature_offset + 4].copy_from_slice(&value.to_le_bytes());
+    let checksum = ext4_crc32c(u32::MAX, &superblock[..1020]);
+    superblock[1020..1024].copy_from_slice(&checksum.to_le_bytes());
+    file.seek(SeekFrom::Start(1024)).unwrap();
+    file.write_all(&superblock).unwrap();
     file.sync_all().unwrap();
 }
 
@@ -366,6 +396,44 @@ fn test_unsupported_feature_fails_closed() {
 }
 
 #[test]
+fn test_unknown_incompat_and_ro_compat_bits_fail_closed() {
+    for (label, offset, bit, expected) in [
+        (
+            "orphan-file",
+            92usize,
+            0x0000_1000u32,
+            "orphan_file metadata",
+        ),
+        ("incompat", 96usize, 0x8000_0000u32, "unknown incompat"),
+        (
+            "ro-compat",
+            100usize,
+            0x4000_0000u32,
+            "unknown or unverified ro_compat",
+        ),
+    ] {
+        let clean = unique_test_path(&format!("unknown-feature-{label}-clean.img"));
+        make_metadata_csum_image(&clean);
+        let corrupt = unique_test_path(&format!("unknown-feature-{label}.img"));
+        std::fs::copy(&clean, &corrupt).unwrap();
+        set_superblock_feature_bit(&corrupt, offset, bit);
+        let output = Command::new(env!("CARGO_BIN_EXE_nexfsck"))
+            .args(["--json", "-n", corrupt.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(4), "{label}: {diagnostic}");
+        assert!(diagnostic.contains(expected), "{label}: {diagnostic}");
+        std::fs::remove_file(corrupt).unwrap();
+        std::fs::remove_file(clean).unwrap();
+    }
+}
+
+#[test]
 fn test_external_extent_block_checksum_corruption_oracle() {
     let source = unique_test_path("extent-csum-source");
     std::fs::create_dir(&source).unwrap();
@@ -453,6 +521,20 @@ fn test_external_extent_block_checksum_corruption_oracle() {
         .output()
         .unwrap();
     assert_eq!(repair.status.code(), Some(4));
+    let repair_diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&repair.stdout),
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    assert!(
+        repair_diagnostic.contains("metadata checksum failure"),
+        "{repair_diagnostic}"
+    );
+    assert!(
+        repair_diagnostic.contains("repair_eligible\": false")
+            || repair_diagnostic.contains("Repair Blocked"),
+        "repair trust decision was not reported: {repair_diagnostic}"
+    );
     assert_eq!(std::fs::read(&corrupt).unwrap(), corrupt_bytes);
     assert!(
         !undo.exists(),
@@ -475,6 +557,123 @@ fn test_external_extent_block_checksum_corruption_oracle() {
     );
     std::fs::remove_file(corrupt).unwrap();
     std::fs::remove_file(image).unwrap();
+    std::fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
+fn test_external_xattr_block_integrity_oracle() {
+    let source = unique_test_path("xattr-source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("file"), b"xattr fixture").unwrap();
+    let value_file = unique_test_path("xattr-value");
+    std::fs::write(&value_file, vec![0x5a; 1024]).unwrap();
+    let image = unique_test_path("xattr-clean.img");
+    assert!(Command::new("truncate")
+        .args(["-s", "64M", image.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-O",
+            "metadata_csum",
+            "-d",
+            source.to_str().unwrap(),
+            image.to_str().unwrap()
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let set_xattr = Command::new("debugfs")
+        .args([
+            "-w",
+            "-R",
+            &format!(
+                "ea_set -f {} /file user.large",
+                value_file.to_string_lossy()
+            ),
+            image.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(set_xattr.status.success());
+    let stat = Command::new("debugfs")
+        .args(["-R", "stat /file", image.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stat_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stat.stdout),
+        String::from_utf8_lossy(&stat.stderr)
+    );
+    let xattr_block = stat_text
+        .lines()
+        .find_map(|line| line.strip_prefix("File ACL:"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|block| *block != 0)
+        .unwrap_or_else(|| panic!("fixture did not allocate an external xattr block: {stat_text}"));
+    let (block_size, _, _, _, _) = ext4_layout(&image);
+    let mut xattr_entry = [0u8; 36];
+    let mut file = std::fs::File::open(&image).unwrap();
+    file.seek(SeekFrom::Start(xattr_block * block_size + 32))
+        .unwrap();
+    file.read_exact(&mut xattr_entry).unwrap();
+    let value_offset = u16::from_le_bytes(xattr_entry[2..4].try_into().unwrap()) as u64;
+    assert!(value_offset >= 32);
+
+    let (code, clean_json) = run_nexfsck_json(&image);
+    assert_eq!(code, 0, "{clean_json}");
+    assert!(clean_json.contains("\"xattr_block_corruptions\": 0"));
+    assert!(clean_json.contains("\"xattr_checksum_failures\": 0"));
+    assert!(Command::new("e2fsck")
+        .args(["-f", "-n", image.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+
+    let corruptions = [
+        ("header", 0u64, vec![0xff]),
+        ("entry-bound", 32u64, vec![u8::MAX]),
+        ("value-offset", 34u64, u16::MAX.to_le_bytes().to_vec()),
+        ("checksum", 16u64, vec![0xff; 4]),
+        ("payload", value_offset, vec![0]),
+    ];
+    for (label, offset, bytes) in corruptions {
+        let corrupt = unique_test_path(&format!("xattr-{label}.img"));
+        std::fs::copy(&image, &corrupt).unwrap();
+        set_image_bytes(&corrupt, xattr_block * block_size + offset, &bytes);
+        let (code, json) = run_nexfsck_json(&corrupt);
+        assert_eq!(code, 4, "{label}: {json}");
+        let e2 = Command::new("e2fsck")
+            .args(["-f", "-n", corrupt.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&e2.stdout),
+            String::from_utf8_lossy(&e2.stderr)
+        );
+        assert!(
+            e2.status.code() != Some(0) || diagnostic.to_lowercase().contains("extended attribute"),
+            "e2fsck did not diagnose {label}: {diagnostic}"
+        );
+        if label == "checksum" || label == "payload" {
+            assert!(
+                json.contains("\"xattr_checksum_failures\": 1"),
+                "{label}: {json}"
+            );
+        } else {
+            assert!(
+                json.contains("\"xattr_block_corruptions\": 1"),
+                "{label}: {json}"
+            );
+        }
+        std::fs::remove_file(corrupt).unwrap();
+    }
+    std::fs::remove_file(image).unwrap();
+    std::fs::remove_file(value_file).unwrap();
     std::fs::remove_dir_all(source).unwrap();
 }
 

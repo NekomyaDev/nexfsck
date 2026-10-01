@@ -19,9 +19,9 @@ the underlying metadata.
 | Directory leaf block | Dirents parsed, no checksum | Validated | CRC32c uses filesystem seed, inode number, generation and bytes before the fake tail |
 | HTree root/node | Structure partially validated | Checksum validated; structural validation partial | CRC32c uses inode context, occupied entry range and dx tail; real indexed-image corruption test |
 | External extent-tree block | Extents parsed, no checksum | Validated | CRC32c uses inode number/generation seed and the `eh_max`-defined extent tail; clean and corrupted real-image oracle test |
-| Extended-attribute block | Not parsed | Unsupported coverage | No checksum validation |
-| MMP block | Magic/state parsed | Partially validated | MMP checksum and sequence freshness validation are not implemented |
-| JBD2 | Header/transactions parsed | Partially validated | Journal checksum-v3 data tags are checked; full journal metadata checksum coverage is not claimed |
+| Extended-attribute block | Not parsed | Checksum and bounds validation; partial semantics | External value ranges/header/refcount parsed; kernel CRC32c uses filesystem seed and block number. Header/entry hash consistency and cross-inode refcount accounting are not yet verified |
+| MMP block | Feature detected before scan | Explicitly rejected | No MMP sequence/checksum or active-owner validation; MMP filesystems are not reported clean |
+| JBD2 | Journal inode/superblock state parsed | Partially validated; malformed/unknown formats fail closed | The inspection path validates basic location/header/features and clean/dirty state. Replay-plan helpers test v3 data-tag validation, but JBD2 superblock/descriptor/commit/revoke checksum coverage is not complete or claimed |
 
 For `gdt_csum` without `metadata_csum`, group descriptors use the legacy CRC16
 rule over UUID, group number and descriptor bytes excluding the checksum field.
@@ -31,8 +31,9 @@ rule over UUID, group number and descriptor bytes excluding the checksum field.
 | Feature | Status | Current scope / limitation |
 | --- | --- | --- |
 | extents | Partially supported | Inline roots/external nodes parsed and external-node checksums verified; complete extent-tree semantic parity is not claimed |
+| External xattr blocks | Partially supported | External xattr block structure/checksum and bounds verified; semantic hashes and cross-inode refcount accounting remain unchecked |
 | 64bit | Read-only supported | High block-address fields and descriptor sizes are parsed |
-| metadata_csum | Partially supported | Superblock, group descriptor, allocation bitmap, inode, directory/HTree and external extent checksums validated; MMP and xattr remain incomplete |
+| metadata_csum | Partially supported | Superblock, group descriptor, allocation bitmap, inode, directory/HTree, external extent and external xattr block checksums validated; xattr semantics and MMP remain incomplete |
 | metadata_csum_seed | Read-only supported | Explicit checksum seed used for implemented checksum classes |
 | gdt_csum | Partially supported | Legacy group descriptor CRC16 validated |
 | sparse_super2 | Read-only supported | Backup-superblock placement follows the two explicit backup group numbers |
@@ -57,3 +58,9 @@ If any checksum failure is observed, repair mode refuses all bitmap mutations
 for that run. A checksum mismatch does not establish whether the payload or only
 the stored checksum is wrong. The extent-node corruption oracle also verifies
 that no undo journal is created and the image bytes remain unchanged.
+
+The CLI now reports a centralized repair eligibility decision and its blocking
+reasons in JSON/human output. Invalid inode/extent structure, directory or
+reference validation errors, dirty journal state, and storage media errors also
+block bitmap repair. A checksum-failed filesystem may still be scanned read-only
+to collect independent diagnostics.
