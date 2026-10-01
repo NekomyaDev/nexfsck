@@ -157,7 +157,7 @@ def generate_frames():
     nexfsck_p2 = ("INFO Pass 2: Directory Entries & H-Tree (2,412 blks)", (248, 250, 252), False)
     nexfsck_p3 = ("INFO Pass 3: Directory Connectivity (0 orphans)", (248, 250, 252), False)
     nexfsck_p4 = ("INFO Pass 4: Inode Reference Counts (0 mismatch)", (248, 250, 252), False)
-    nexfsck_p5 = ("INFO Pass 5: 64-bit Roaring Bitmap Reconciliation", (248, 250, 252), False)
+    nexfsck_p5 = ("INFO Pass 5: Adaptive Bitmap Reconciliation", (248, 250, 252), False)
     nexfsck_summary = [
         ("--------------------------------------------------", (51, 65, 85), False),
         ("Detailed Accounting:", (255, 255, 255), True),

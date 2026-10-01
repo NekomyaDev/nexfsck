@@ -21,7 +21,7 @@
 | Journal | Fail-closed descriptor/tag/commit/revoke parsing into a bounded replay plan, including 64-bit block tags and checksum-v3 data verification. Only committed, non-revoked writes enter the plan. The library application path durably records each pre-image before writing and is interruption-tested; CLI application remains disabled pending broader real-image fixtures. |
 | Repair safety | Versioned, checksummed pre-mutation block images are synced before mutation. Rollback validates complete records and syncs every restored block; replay is idempotent and can restart after interruption. This is not filesystem-level transactional atomicity. |
 | UI/metrics | Summary output includes a block-group heatmap, measured scan throughput, and IOPS. `--metrics-listen HOST:PORT` exposes live Prometheus text metrics at `/metrics` while a check runs. |
-| 64-bit tracking | Block numbers are split into `HashMap<u32, RoaringBitmap>` chunks. This preserves 64-bit addresses. `cargo run --release -p nexfsck-compute --example bitmap_profile -- ENTRIES STRIDE` measures elapsed time, chunk count, and RSS for dense or adversarial sparse patterns; results remain machine-specific. |
+| 64-bit tracking | Address spaces requiring at most 64 MiB of bitmap storage use a dense `u64` bitset and word-at-a-time reconciliation. Larger spaces fall back to `HashMap<u32, RoaringBitmap>` chunks, preserving 64-bit addresses without unbounded dense allocation. |
 
 The GPU probe and CPU feature detection must not be interpreted as evidence that those devices or instruction sets participated in a check. Runtime output labels them explicitly as detected capabilities only.
 
@@ -33,13 +33,14 @@ New performance claims must include the fixture-generation command, CPU, RAM, st
 
 ### Latest measured 10 GiB run
 
-On the committed 10 GiB sparse fixture (100,000 generated files, 80 block groups, `/tmp` tmpfs), 10 interleaved warm-cache repetitions measured median wall times of **0.128 s for e2fsck** and **0.119 s for adaptive nexfsck**. In this specific run nexfsck was about **1.08× faster**. Both reported 1,182,220 allocated blocks; nexfsck reported zero errors. Nexfsck also completed 30/30 endurance passes with observed peak RSS between 36.86 and 37.49 MiB, followed by successful corruption detection, repair, verification, rollback, and restored-corruption detection.
+On the committed 10 GiB sparse fixture (100,000 generated files, 80 block groups, `/tmp` tmpfs), 10 interleaved warm-cache repetitions measured median wall times of **0.130 s for e2fsck** and **0.053 s for adaptive nexfsck**. Both reported 1,182,223 allocated blocks; nexfsck reported zero errors. Nexfsck also completed 30/30 endurance passes with observed peak RSS between 37.62 and 37.87 MiB, followed by successful corruption detection, repair, verification, rollback, and restored-corruption detection.
 
-The controlled backend matrix measured 0.322 s (`io_uring`+CUDA), 0.124 s (`io_uring`+CPU), 0.314 s (sync+CUDA), 0.117 s (sync+CPU), and 0.118 s (adaptive) medians. Use `--profile` for the phase timing report. CUDA remains available as an explicit diagnostic override; it is not selected merely because a GPU is present.
+The controlled backend matrix measured 0.261 s (`io_uring`+CUDA), 0.054 s (`io_uring`+CPU), 0.252 s (sync+CUDA), 0.0476 s (sync+CPU), and 0.0484 s (adaptive) medians. Use `--profile` for the phase timing report. CUDA remains available as an explicit diagnostic override; it is not selected merely because a GPU is present.
 
 These are environment-specific selected-counter results, not bit-exact parity or production-storage performance. The fixture was memory-backed and cache was not globally dropped. See the machine-readable [`benchmark-results/latest.json`](benchmark-results/latest.json), raw logs in [`benchmark-results`](benchmark-results), and the reproducible runner [`scripts/stress_benchmark.py`](scripts/stress_benchmark.py).
 
 The fixed-cost diagnosis, ranked phase timings, backend tradeoffs, and CUDA calibration curve are documented in [`docs/performance-profile.md`](docs/performance-profile.md).
+The allocation, bitmap, directory, thread-scaling, and additional-workload results are documented in [`docs/hot-path-optimization.md`](docs/hot-path-optimization.md).
 
 ## Workspace architecture
 

@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use nexfsck_compute::{
     collect_directory_blocks, collect_inode_extents, reconcile_block_bitmap,
-    reconcile_inode_bitmap, verify_directory_block_detailed, verify_htree_directory,
+    reconcile_inode_bitmap, verify_directory_block_compact, verify_htree_directory,
     verify_inodes_parallel, BitmapDiscrepancy, BlockAllocationTracker, HardwareProfile,
     InodeBitmapDiscrepancy, InodeVerificationStats,
 };
@@ -345,7 +345,7 @@ fn main() -> ExitCode {
     }
     profile.mark("journal_inspection");
 
-    // 5. Initialize In-Memory Roaring Bitmaps & Telemetry
+    // 5. Initialize adaptive allocation tracking and telemetry
     let tracker = BlockAllocationTracker::new(total_blocks);
     let inode_stats = InodeVerificationStats::new();
     let mut stats = ProgressStats::new(bg_count);
@@ -395,6 +395,11 @@ fn main() -> ExitCode {
         std::collections::HashMap::new();
     let mut all_scanned_inodes = Vec::new();
     let mut compute_intervals = Vec::new();
+    let mut inode_table_read_time = Duration::ZERO;
+    let mut inode_decode_time = Duration::ZERO;
+    let mut inode_metadata_collection_time = Duration::ZERO;
+    let mut inode_validation_tracking_time = Duration::ZERO;
+    let mut inactive_inode_count = 0u64;
 
     for (bg_idx, desc) in group_descriptors.iter().enumerate() {
         let free_inodes = desc.free_inodes_count(is_64bit);
@@ -414,11 +419,19 @@ fn main() -> ExitCode {
 
         let mut group_had_error = false;
         let mut group_bytes = 0;
-        match dev.read_inode_table(&sb, desc, is_64bit) {
+        let operation_started = Instant::now();
+        let table_result = dev.read_inode_table(&sb, desc, is_64bit);
+        inode_table_read_time += operation_started.elapsed();
+        match table_result {
             Ok(table_bytes) => {
+                let operation_started = Instant::now();
                 let inodes =
                     BlockDevice::parse_inodes_from_table(&table_bytes, sb.inode_size() as usize);
+                inode_decode_time += operation_started.elapsed();
+                inactive_inode_count +=
+                    inodes.iter().filter(|inode| !inode.is_used()).count() as u64;
 
+                let operation_started = Instant::now();
                 for (i, inode) in inodes.iter().enumerate() {
                     let ino_num = (bg_idx as u32) * sb.inodes_per_group() + (i as u32) + 1;
                     if inode.is_used() && inode.is_dir() {
@@ -444,10 +457,13 @@ fn main() -> ExitCode {
                         );
                     }
                 }
+                inode_metadata_collection_time += operation_started.elapsed();
 
+                let operation_started = Instant::now();
                 verify_inodes_parallel(&inodes, &tracker, &inode_stats, &|blk| {
                     dev.read_block(blk, block_size).ok()
                 });
+                inode_validation_tracking_time += operation_started.elapsed();
                 group_bytes = table_bytes.len() as u64;
                 all_scanned_inodes.push((bg_idx, inodes));
             }
@@ -465,6 +481,19 @@ fn main() -> ExitCode {
         live_metrics.update(&stats);
     }
     profile.mark("inode_table_scanning_extent_tree_parsing");
+    profile.record("inode_table_reads", inode_table_read_time);
+    profile.record("inode_decoding", inode_decode_time);
+    profile.record(
+        "inode_metadata_extent_collection",
+        inode_metadata_collection_time,
+    );
+    profile.record(
+        "inode_validation_allocation_tracking",
+        inode_validation_tracking_time,
+    );
+    if profile.enabled {
+        eprintln!("NEXFSCK_PROFILE counter=inactive_inodes value={inactive_inode_count}");
+    }
 
     // CUDA is deliberately lazy: loading the driver/context before the amount
     // of collision work is known was the dominant fixed startup cost.
@@ -516,14 +545,16 @@ fn main() -> ExitCode {
         );
     }
     let mut total_dentry_count = 0;
-    let mut actual_link_counts: std::collections::HashMap<u32, u16> =
-        std::collections::HashMap::new();
-    let mut reachable_from_dir: std::collections::HashSet<u32> = std::collections::HashSet::new();
-
-    reachable_from_dir.insert(nexfsck_core::EXT4_ROOT_INO);
+    let inode_slots = sb.total_inodes() as usize + 1;
+    let mut actual_link_counts = vec![0u16; inode_slots];
+    let mut reachable_from_dir = vec![false; inode_slots];
+    reachable_from_dir[nexfsck_core::EXT4_ROOT_INO as usize] = true;
 
     let blocks_to_fetch: Vec<u64> = directory_blocks_to_check.iter().map(|(_, b)| *b).collect();
+    let directory_read_started = Instant::now();
     let batch_reads = dev.read_blocks_batch(&blocks_to_fetch, block_size);
+    let directory_read_time = directory_read_started.elapsed();
+    let cache_build_started = Instant::now();
     let mut block_cache: std::collections::HashMap<u64, Vec<u8>> =
         std::collections::HashMap::with_capacity(batch_reads.len());
     for (blk, res) in batch_reads {
@@ -539,7 +570,9 @@ fn main() -> ExitCode {
             }
         }
     }
+    let directory_cache_build_time = cache_build_started.elapsed();
 
+    let htree_started = Instant::now();
     for (inode, (layout, indexed)) in &directory_layouts {
         if !indexed || layout.is_empty() {
             continue;
@@ -551,7 +584,7 @@ fn main() -> ExitCode {
             layout
                 .get(logical as usize)
                 .and_then(|physical| block_cache.get(physical))
-                .cloned()
+                .map(Vec::as_slice)
         });
         for message in &htree.errors {
             warn!("H-Tree inode {}: {}", inode, message);
@@ -560,25 +593,33 @@ fn main() -> ExitCode {
             .corrupt_directories
             .fetch_add(htree.errors.len() as u64, Ordering::Relaxed);
     }
+    let htree_time = htree_started.elapsed();
 
+    let dirent_started = Instant::now();
     for (_dir_ino, dir_block) in directory_blocks_to_check {
         if let Some(block_bytes) = block_cache.get(&dir_block) {
-            let res = verify_directory_block_detailed(block_bytes, sb.total_inodes());
+            let res = verify_directory_block_compact(block_bytes, sb.total_inodes());
             total_dentry_count += res.entries.len();
             if res.corrupt_entries > 0 {
                 inode_stats
                     .corrupt_directories
                     .fetch_add(res.corrupt_entries, Ordering::Relaxed);
             }
-            for (child_ino, name) in res.entries {
-                *actual_link_counts.entry(child_ino).or_insert(0) += 1;
-                if name != "." && name != ".." {
-                    reachable_from_dir.insert(child_ino);
+            for entry in res.entries {
+                actual_link_counts[entry.inode as usize] =
+                    actual_link_counts[entry.inode as usize].saturating_add(1);
+                if !entry.is_dot_or_dotdot {
+                    reachable_from_dir[entry.inode as usize] = true;
                 }
             }
         }
     }
+    let dirent_time = dirent_started.elapsed();
     profile.mark("directory_pass");
+    profile.record("directory_block_reads", directory_read_time);
+    profile.record("directory_block_cache_build", directory_cache_build_time);
+    profile.record("directory_htree_validation", htree_time);
+    profile.record("directory_dirent_parse_and_reference_arrays", dirent_time);
     let corrupt_dirs = inode_stats.corrupt_directories.load(Ordering::Relaxed);
     if !args.json {
         info!(
@@ -598,7 +639,7 @@ fn main() -> ExitCode {
             if inode.is_used()
                 && inode.is_dir()
                 && ino_num >= sb.first_inode()
-                && !reachable_from_dir.contains(&ino_num)
+                && !reachable_from_dir[ino_num as usize]
             {
                 warn!(
                     "Orphan directory detected: Inode {} is disconnected from root directory tree",
@@ -629,7 +670,7 @@ fn main() -> ExitCode {
             let ino_num = (*bg_idx as u32) * sb.inodes_per_group() + (i as u32) + 1;
             if inode.is_used() && ino_num >= sb.first_inode() {
                 let recorded_links = inode.links_count();
-                let actual_links = actual_link_counts.get(&ino_num).copied().unwrap_or(0);
+                let actual_links = actual_link_counts[ino_num as usize];
                 if actual_links > 0 && recorded_links != actual_links {
                     debug!(
                         "Link count discrepancy on inode {}: recorded={}, actual={}",
@@ -653,10 +694,14 @@ fn main() -> ExitCode {
 
     // Pass 5: Block & Inode Allocation Bitmap Reconciliation
     if !args.json {
-        info!("Pass 5: Reconciling On-Disk Bitmaps against In-Memory Roaring Bitmaps...");
+        info!("Pass 5: Reconciling on-disk bitmaps against reconstructed allocation state...");
     }
     let mut total_block_discrepancy = BitmapDiscrepancy::default();
     let mut total_inode_discrepancy = InodeBitmapDiscrepancy::default();
+    let mut block_bitmap_read_time = Duration::ZERO;
+    let mut inode_bitmap_read_time = Duration::ZERO;
+    let mut block_bitmap_compare_time = Duration::ZERO;
+    let mut inode_bitmap_compare_time = Duration::ZERO;
     for (bg_idx, desc) in group_descriptors.iter().enumerate() {
         if desc.is_block_uninit() {
             continue;
@@ -668,15 +713,24 @@ fn main() -> ExitCode {
         }
         let blocks_in_this_group = (total_blocks - first_block).min(blocks_per_group as u64) as u32;
 
-        if let Ok(disk_bm) = dev.read_block_bitmap(desc, is_64bit, block_size) {
+        let operation_started = Instant::now();
+        let block_bitmap = dev.read_block_bitmap(desc, is_64bit, block_size);
+        block_bitmap_read_time += operation_started.elapsed();
+        if let Ok(disk_bm) = block_bitmap {
+            let operation_started = Instant::now();
             let disc =
                 reconcile_block_bitmap(&disk_bm, &tracker, first_block, blocks_in_this_group);
+            block_bitmap_compare_time += operation_started.elapsed();
             total_block_discrepancy.false_free_blocks += disc.false_free_blocks;
             total_block_discrepancy.leaked_blocks += disc.leaked_blocks;
         }
 
-        if let Ok(disk_inomb) = dev.read_inode_bitmap(desc, is_64bit, block_size) {
+        let operation_started = Instant::now();
+        let inode_bitmap = dev.read_inode_bitmap(desc, is_64bit, block_size);
+        inode_bitmap_read_time += operation_started.elapsed();
+        if let Ok(disk_inomb) = inode_bitmap {
             if let Some((_, inodes)) = all_scanned_inodes.iter().find(|(idx, _)| *idx == bg_idx) {
+                let operation_started = Instant::now();
                 let disc = reconcile_inode_bitmap(
                     &disk_inomb,
                     inodes,
@@ -684,12 +738,17 @@ fn main() -> ExitCode {
                     bg_idx,
                     sb.inodes_per_group(),
                 );
+                inode_bitmap_compare_time += operation_started.elapsed();
                 total_inode_discrepancy.false_free_inodes += disc.false_free_inodes;
                 total_inode_discrepancy.leaked_inodes += disc.leaked_inodes;
             }
         }
     }
     profile.mark("bitmap_reconciliation");
+    profile.record("block_bitmap_reads", block_bitmap_read_time);
+    profile.record("inode_bitmap_reads", inode_bitmap_read_time);
+    profile.record("block_bitmap_word_comparison", block_bitmap_compare_time);
+    profile.record("inode_bitmap_comparison", inode_bitmap_compare_time);
 
     let corruptions = inode_stats.extent_corruptions.load(Ordering::Relaxed);
     let duplicates = inode_stats.duplicate_blocks.load(Ordering::Relaxed);
@@ -877,6 +936,7 @@ fn main() -> ExitCode {
         );
         println!("  \"allocated_blocks\": {},", tracker.allocated_count());
         println!("  \"directory_entries\": {},", total_dentry_count);
+        println!("  \"extent_intervals\": {},", compute_intervals.len());
         println!("  \"corrupt_directories\": {},", corrupt_dirs);
         println!("  \"orphan_directories\": {},", orphan_dirs);
         println!("  \"link_count_mismatches\": {},", link_mismatches);
@@ -937,8 +997,9 @@ fn main() -> ExitCode {
             inode_stats.extent_trees_checked.load(Ordering::Relaxed)
         );
         println!(
-            "Allocated Blocks   : {} (Tracked in Roaring Bitmaps)",
-            tracker.allocated_count()
+            "Allocated Blocks   : {} (Tracked in {})",
+            tracker.allocated_count(),
+            tracker.representation_name()
         );
         println!("Directory Entries  : {}", total_dentry_count);
         println!("Corrupt Directories: {}", corrupt_dirs);

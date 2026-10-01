@@ -1,0 +1,7 @@
+{
+  "groups": 80,
+  "blocks": 2621440,
+  "dense_word_bitset": {"elapsed_ms": 0.165, "ns_per_group": 2068.4},
+  "chunked_roaring": {"elapsed_ms": 48.397, "ns_per_group": 604963.0},
+  "avx2": "not implemented: the scalar 64-bit path is only ~0.12 ms in the real profile and 0.165 ms in the isolated benchmark, leaving no material end-to-end target"
+}

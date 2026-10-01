@@ -1,0 +1,11 @@
+{
+  "method": "forced Rayon for every inode group; 10 warm-cache runs per setting",
+  "note": "negative experiment; forced parallelism was reverted",
+  "threads": {
+    "1": {"median_seconds": 0.044656, "p95_seconds": 0.046028, "stddev_seconds": 0.000559},
+    "2": {"median_seconds": 0.052603, "p95_seconds": 0.070229, "stddev_seconds": 0.005397},
+    "4": {"median_seconds": 0.053267, "p95_seconds": 0.054476, "stddev_seconds": 0.000498},
+    "8": {"median_seconds": 0.058810, "p95_seconds": 0.060622, "stddev_seconds": 0.000771},
+    "16": {"median_seconds": 0.062967, "p95_seconds": 0.070521, "stddev_seconds": 0.002380}
+  }
+}

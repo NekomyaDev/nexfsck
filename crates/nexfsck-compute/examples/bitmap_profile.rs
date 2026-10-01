@@ -34,7 +34,7 @@ fn main() {
     let after = rss_kib();
     println!(
         "entries={entries} stride={stride} chunks={} elapsed_ms={} rss_delta_kib={}",
-        tracker.chunks.read().unwrap().len(),
+        tracker.sparse_chunk_count(),
         started.elapsed().as_millis(),
         after.saturating_sub(before)
     );

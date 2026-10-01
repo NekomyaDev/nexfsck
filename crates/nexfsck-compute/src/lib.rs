@@ -189,20 +189,62 @@ impl InodeVerificationStats {
 pub struct BlockAllocationTracker {
     total_blocks: u64,
     allocated_count: AtomicU64,
+    dense_words: Option<RwLock<Vec<u64>>>,
     pub chunks: RwLock<HashMap<u32, RoaringBitmap>>,
 }
 
 impl BlockAllocationTracker {
     pub fn new(total_blocks: u64) -> Self {
+        // Cap the dense representation at 64 MiB. It is substantially faster
+        // for ordinary filesystems while the chunked representation preserves
+        // sparse 64-bit addressing for very large spaces.
+        let dense_words = usize::try_from(total_blocks.div_ceil(64))
+            .ok()
+            .filter(|words| *words <= (64 * 1024 * 1024 / 8))
+            .map(|words| RwLock::new(vec![0; words]));
         Self {
             total_blocks,
             allocated_count: AtomicU64::new(0),
+            dense_words,
             chunks: RwLock::new(HashMap::new()),
         }
     }
 
     /// Marks a range of 64-bit blocks as allocated. Returns true if no collision detected.
     pub fn mark_range(&self, start_block: u64, count: u32) -> bool {
+        if count == 0 {
+            return true;
+        }
+        if let Some(dense) = &self.dense_words {
+            let end = start_block
+                .saturating_add(count as u64)
+                .min(self.total_blocks);
+            if start_block >= end {
+                return false;
+            }
+            let mut words = dense.write().unwrap();
+            let mut cursor = start_block;
+            let mut newly_added = 0u64;
+            let mut collision = false;
+            while cursor < end {
+                let word_index = (cursor / 64) as usize;
+                let bit = (cursor % 64) as u32;
+                let take = (end - cursor).min((64 - bit) as u64) as u32;
+                let mask = if take == 64 {
+                    u64::MAX
+                } else {
+                    ((1u64 << take) - 1) << bit
+                };
+                let occupied = words[word_index] & mask;
+                collision |= occupied != 0;
+                newly_added += (mask & !words[word_index]).count_ones() as u64;
+                words[word_index] |= mask;
+                cursor += take as u64;
+            }
+            self.allocated_count
+                .fetch_add(newly_added, Ordering::Relaxed);
+            return !collision;
+        }
         let mut chunks = self.chunks.write().unwrap();
         let mut collision = false;
         let mut newly_added = 0u64;
@@ -232,6 +274,13 @@ impl BlockAllocationTracker {
     }
 
     pub fn is_allocated(&self, block: u64) -> bool {
+        if let Some(dense) = &self.dense_words {
+            if block >= self.total_blocks {
+                return false;
+            }
+            let words = dense.read().unwrap();
+            return words[(block / 64) as usize] & (1u64 << (block % 64)) != 0;
+        }
         let chunk_idx = (block >> 32) as u32;
         let offset = (block & 0xFFFF_FFFF) as u32;
 
@@ -240,6 +289,22 @@ impl BlockAllocationTracker {
             bm.contains(offset)
         } else {
             false
+        }
+    }
+
+    pub fn is_dense(&self) -> bool {
+        self.dense_words.is_some()
+    }
+
+    pub fn sparse_chunk_count(&self) -> usize {
+        self.chunks.read().unwrap().len()
+    }
+
+    pub fn representation_name(&self) -> &'static str {
+        if self.is_dense() {
+            "dense bitset"
+        } else {
+            "chunked Roaring bitmaps"
         }
     }
 }
@@ -462,6 +527,35 @@ pub fn reconcile_block_bitmap(
     blocks_in_group: u32,
 ) -> BitmapDiscrepancy {
     let mut discrepancy = BitmapDiscrepancy::default();
+    if let Some(dense) = &tracker.dense_words {
+        let words = dense.read().unwrap();
+        let mut processed = 0u32;
+        for disk_chunk in disk_bitmap.chunks(8) {
+            if processed >= blocks_in_group {
+                break;
+            }
+            let valid = (blocks_in_group - processed).min(64);
+            let mut bytes = [0u8; 8];
+            bytes[..disk_chunk.len()].copy_from_slice(disk_chunk);
+            let disk_word = u64::from_le_bytes(bytes);
+            let absolute = first_block_in_group + processed as u64;
+            let word_index = (absolute / 64) as usize;
+            let shift = (absolute % 64) as u32;
+            let mut tracked = words.get(word_index).copied().unwrap_or(0) >> shift;
+            if shift != 0 {
+                tracked |= words.get(word_index + 1).copied().unwrap_or(0) << (64 - shift);
+            }
+            let mask = if valid == 64 {
+                u64::MAX
+            } else {
+                (1u64 << valid) - 1
+            };
+            discrepancy.false_free_blocks += (tracked & !disk_word & mask).count_ones() as u64;
+            discrepancy.leaked_blocks += (!tracked & disk_word & mask).count_ones() as u64;
+            processed += valid;
+        }
+        return discrepancy;
+    }
     let chunks = tracker.chunks.read().unwrap();
 
     for i in 0..blocks_in_group {
@@ -499,6 +593,18 @@ pub struct DirectoryValidationResult {
     pub corrupt_entries: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactDirectoryEntry {
+    pub inode: u32,
+    pub is_dot_or_dotdot: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct CompactDirectoryValidationResult {
+    pub entries: Vec<CompactDirectoryEntry>,
+    pub corrupt_entries: u64,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HTreeValidationResult {
     pub indexed_blocks: u64,
@@ -506,13 +612,13 @@ pub struct HTreeValidationResult {
     pub errors: Vec<String>,
 }
 
-pub fn verify_htree_directory<F>(
+pub fn verify_htree_directory<'a, F>(
     root: &[u8],
     logical_block_count: u32,
     read_logical: &F,
 ) -> HTreeValidationResult
 where
-    F: Fn(u32) -> Option<Vec<u8>>,
+    F: Fn(u32) -> Option<&'a [u8]>,
 {
     let mut result = HTreeValidationResult::default();
     if root.len() < 40 {
@@ -556,7 +662,7 @@ where
     result
 }
 
-fn validate_dx_entries<F>(
+fn validate_dx_entries<'a, F>(
     block: &[u8],
     count_offset: usize,
     levels: u8,
@@ -565,7 +671,7 @@ fn validate_dx_entries<F>(
     visited: &mut std::collections::HashSet<u32>,
     result: &mut HTreeValidationResult,
 ) where
-    F: Fn(u32) -> Option<Vec<u8>>,
+    F: Fn(u32) -> Option<&'a [u8]>,
 {
     if count_offset + 8 > block.len() {
         result
@@ -630,14 +736,14 @@ fn validate_dx_entries<F>(
         };
         if levels == 0 {
             result.leaf_blocks += 1;
-            if verify_directory_block_detailed(&child_data, u32::MAX).corrupt_entries > 0 {
+            if verify_directory_block_compact(child_data, u32::MAX).corrupt_entries > 0 {
                 result.errors.push(format!(
                     "H-Tree leaf logical block {child} contains invalid entries"
                 ));
             }
         } else {
             validate_dx_entries(
-                &child_data,
+                child_data,
                 8,
                 levels - 1,
                 logical_block_count,
@@ -701,6 +807,49 @@ pub fn verify_directory_block_detailed(
     }
 
     res
+}
+
+/// Allocation-light directory parsing for the checker hot path. Names are
+/// validated in place and only the information needed by later passes survives.
+pub fn verify_directory_block_compact(
+    block_bytes: &[u8],
+    max_inodes: u32,
+) -> CompactDirectoryValidationResult {
+    let mut result = CompactDirectoryValidationResult::default();
+    let mut offset = 0;
+    while offset + 8 <= block_bytes.len() {
+        let Ok((header, _)) = Ext4DirEntry2Header::ref_from_prefix(&block_bytes[offset..]) else {
+            result.corrupt_entries += 1;
+            break;
+        };
+        let rec_len = header.record_len() as usize;
+        let name_len = header.name_length() as usize;
+        if rec_len < 8 || rec_len & 3 != 0 || offset + rec_len > block_bytes.len() {
+            result.corrupt_entries += 1;
+            break;
+        }
+        let inode = header.inode_number();
+        if inode != 0 {
+            if header.entry_file_type() == EXT4_FT_DIR_CSUM {
+                break;
+            }
+            if inode > max_inodes || name_len == 0 || 8 + name_len > rec_len {
+                result.corrupt_entries += 1;
+            } else {
+                let name = &block_bytes[offset + 8..offset + 8 + name_len];
+                if name.contains(&b'/') || name.contains(&0) {
+                    result.corrupt_entries += 1;
+                } else {
+                    result.entries.push(CompactDirectoryEntry {
+                        inode,
+                        is_dot_or_dotdot: name == b"." || name == b"..",
+                    });
+                }
+            }
+        }
+        offset += rec_len;
+    }
+    result
 }
 
 /// Directory validation and entry parser (backwards compatibility wrapper).
@@ -863,8 +1012,9 @@ mod htree_tests {
         root[36..40].copy_from_slice(&1u32.to_le_bytes());
         let mut leaf = vec![0u8; 4096];
         leaf[4..6].copy_from_slice(&4096u16.to_le_bytes());
-        let result =
-            verify_htree_directory(&root, 2, &|logical| (logical == 1).then(|| leaf.clone()));
+        let result = verify_htree_directory(&root, 2, &|logical| {
+            (logical == 1).then_some(leaf.as_slice())
+        });
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(result.leaf_blocks, 1);
     }
@@ -904,5 +1054,41 @@ mod bitmap_tests {
         let high = (1u64 << 32) + 123;
         assert!(tracker.mark_range(high, 8));
         assert!(!tracker.mark_range(high + 7, 2));
+    }
+
+    #[test]
+    fn dense_word_reconciliation_matches_scalar_reference() {
+        let total = 131_173u64;
+        let tracker = BlockAllocationTracker::new(total);
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for _ in 0..4_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let start = state % (total - 33);
+            tracker.mark_range(start, (state as u32 % 32) + 1);
+        }
+        for first in [0, 1, 32_768, 65_537, 100_000] {
+            let count = ((total - first).min(32_768)) as u32;
+            let mut disk = vec![0u8; count.div_ceil(8) as usize];
+            for index in 0..count {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                if state & 3 != 0 {
+                    disk[(index / 8) as usize] |= 1 << (index % 8);
+                }
+            }
+            let fast = reconcile_block_bitmap(&disk, &tracker, first, count);
+            let mut scalar = BitmapDiscrepancy::default();
+            for index in 0..count {
+                let on_disk = disk[(index / 8) as usize] & (1 << (index % 8)) != 0;
+                let reconstructed = tracker.is_allocated(first + index as u64);
+                scalar.false_free_blocks += u64::from(reconstructed && !on_disk);
+                scalar.leaked_blocks += u64::from(!reconstructed && on_disk);
+            }
+            assert_eq!(fast.false_free_blocks, scalar.false_free_blocks);
+            assert_eq!(fast.leaked_blocks, scalar.leaked_blocks);
+        }
     }
 }
