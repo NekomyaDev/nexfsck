@@ -73,6 +73,7 @@ def source_provenance():
     with open(NEXFSCK_BIN, "rb") as binary:
         for chunk in iter(lambda: binary.read(1024 * 1024), b""):
             digest.update(chunk)
+    artifact_path = os.path.relpath(RESULT_JSON, REPO_ROOT)
     return {
         "benchmarked_source_commit": commit,
         "benchmarked_worktree_clean": not bool(status.strip()),
@@ -83,7 +84,7 @@ def source_provenance():
         # commit from Git history using the documented command instead.
         "artifact_publication_commit": None,
         "artifact_publication_commit_resolution": (
-            "git log -1 --format=%H -- benchmark-results/latest.json"
+            f"git log -1 --format=%H -- {artifact_path}"
         ),
     }
 
