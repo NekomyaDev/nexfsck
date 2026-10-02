@@ -28,9 +28,10 @@ const EXT4_XATTR_VALUE_MAX: usize = 1 << 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XattrBlockValidation {
-    Valid { refcount: u32 },
+    Valid { refcount: u32, entry_count: u32 },
     InvalidStructure,
     InvalidChecksum,
+    InvalidHash,
 }
 
 /// Common filesystem checksum state. Each verifier below follows the ext4
@@ -252,6 +253,7 @@ impl Ext4MetadataChecksum {
         }
 
         let mut cursor = EXT4_XATTR_HEADER_SIZE;
+        let mut entries: Vec<(u8, Vec<u8>, u32, usize, usize)> = Vec::new();
         let entries_end = loop {
             let Some(prefix) = block.get(cursor..cursor.saturating_add(4)) else {
                 return XattrBlockValidation::InvalidStructure;
@@ -269,6 +271,7 @@ impl Ext4MetadataChecksum {
             let value_offset = u16::from_le_bytes(entry_header[2..4].try_into().unwrap()) as usize;
             let value_inode = u32::from_le_bytes(entry_header[4..8].try_into().unwrap());
             let value_size = u32::from_le_bytes(entry_header[8..12].try_into().unwrap()) as usize;
+            let entry_hash = u32::from_le_bytes(entry_header[12..16].try_into().unwrap());
             let entry_len = (EXT4_XATTR_ENTRY_HEADER_SIZE + name_len + 3) & !3;
             let Some(entry) = block.get(cursor..cursor.saturating_add(entry_len)) else {
                 return XattrBlockValidation::InvalidStructure;
@@ -280,6 +283,7 @@ impl Ext4MetadataChecksum {
                     .any(|byte| *byte == 0)
                 || value_size > EXT4_XATTR_VALUE_MAX
                 || value_inode != 0
+                || name_len == 0
             {
                 return XattrBlockValidation::InvalidStructure;
             }
@@ -297,6 +301,16 @@ impl Ext4MetadataChecksum {
                     return XattrBlockValidation::InvalidStructure;
                 }
             }
+            let name = entry[EXT4_XATTR_ENTRY_HEADER_SIZE..EXT4_XATTR_ENTRY_HEADER_SIZE + name_len]
+                .to_vec();
+            if let Some((prev_index, prev_name, ..)) = entries.last() {
+                if (*prev_index, prev_name.len(), prev_name.as_slice())
+                    >= (name_index, name.len(), name.as_slice())
+                {
+                    return XattrBlockValidation::InvalidStructure;
+                }
+            }
+            entries.push((name_index, name, entry_hash, value_offset, value_size));
             cursor += entry_len;
         };
 
@@ -330,7 +344,44 @@ impl Ext4MetadataChecksum {
                 return XattrBlockValidation::InvalidChecksum;
             }
         }
-        XattrBlockValidation::Valid { refcount }
+        // ext4/e2fsprogs semantic xattr hashes are distinct from the block CRC.
+        // Names are rotated/XORed bytewise; values are processed as padded LE
+        // words. A zero header hash is a valid "do not share" marker.
+        let mut block_hash = 0u32;
+        let mut hash_is_shareable = true;
+        let mut value_ranges = Vec::new();
+        for (_, name, stored_hash, value_offset, value_size) in &entries {
+            let padded = (*value_size + 3) & !3;
+            let value = if *value_size == 0 {
+                &[][..]
+            } else {
+                value_ranges.push((*value_offset, *value_offset + padded));
+                let hashed_size = *value_size & !3;
+                &block[*value_offset..*value_offset + hashed_size]
+            };
+            let calculated = ext4_xattr_entry_hash(name, value);
+            if *stored_hash != calculated {
+                return XattrBlockValidation::InvalidHash;
+            }
+            if calculated == 0 {
+                hash_is_shareable = false;
+            } else {
+                block_hash = block_hash.rotate_left(16) ^ calculated;
+            }
+        }
+        value_ranges.sort_unstable();
+        if value_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return XattrBlockValidation::InvalidStructure;
+        }
+        let stored_block_hash = u32::from_le_bytes(block[12..16].try_into().unwrap());
+        let expected_block_hash = if hash_is_shareable { block_hash } else { 0 };
+        if stored_block_hash != 0 && stored_block_hash != expected_block_hash {
+            return XattrBlockValidation::InvalidHash;
+        }
+        XattrBlockValidation::Valid {
+            refcount,
+            entry_count: entries.len() as u32,
+        }
     }
 
     pub fn verify_bitmap(&self, _group: u32, bitmap: &[u8], provided: u32, has_high: bool) -> bool {
@@ -347,6 +398,20 @@ impl Ext4MetadataChecksum {
             provided == (crc & 0xffff)
         }
     }
+}
+
+#[allow(clippy::chunks_exact_to_as_chunks)]
+fn ext4_xattr_entry_hash(name: &[u8], padded_value: &[u8]) -> u32 {
+    const NAME_SHIFT: u32 = 5;
+    const VALUE_SHIFT: u32 = 16;
+    let mut hash = 0u32;
+    for byte in name {
+        hash = hash.rotate_left(NAME_SHIFT) ^ u32::from(*byte);
+    }
+    for word in padded_value.chunks_exact(4) {
+        hash = hash.rotate_left(VALUE_SHIFT) ^ u32::from_le_bytes(word.try_into().unwrap());
+    }
+    hash
 }
 
 fn crc16_ext4(mut crc: u16, bytes: &[u8]) -> u16 {
@@ -711,6 +776,9 @@ mod crc_tests {
         block[40..44].copy_from_slice(&4u32.to_le_bytes());
         block[48] = b'a';
         block[4088..4092].copy_from_slice(b"data");
+        let entry_hash = ext4_xattr_entry_hash(b"a", b"data");
+        block[44..48].copy_from_slice(&entry_hash.to_le_bytes());
+        block[12..16].copy_from_slice(&entry_hash.to_le_bytes());
         install_xattr_checksum(sb, block_number, &mut block);
         block
     }
@@ -835,7 +903,10 @@ mod crc_tests {
         let clean = valid_xattr_block(&sb, block_number);
         assert_eq!(
             verifier.validate_xattr_block(block_number, &clean),
-            XattrBlockValidation::Valid { refcount: 1 }
+            XattrBlockValidation::Valid {
+                refcount: 1,
+                entry_count: 1
+            }
         );
 
         let mut bad_header = clean.clone();
@@ -875,6 +946,41 @@ mod crc_tests {
             assert_eq!(first, second, "nondeterministic result at len={length}");
         }
     }
+
+    #[test]
+    fn external_xattr_semantic_hashes_match_ext4_and_detect_mutation() {
+        let mut sb = test_superblock(256, None);
+        sb.s_feature_ro_compat = 0; // isolate semantic hashes from block CRC
+        let verifier = Ext4MetadataChecksum::new(&sb);
+        let mut clean = valid_xattr_block(&sb, 77);
+        clean[16..20].fill(0);
+        let entry_hash = ext4_xattr_entry_hash(b"a", b"data");
+        assert_eq!(
+            u32::from_le_bytes(clean[44..48].try_into().unwrap()),
+            entry_hash
+        );
+        assert_eq!(
+            verifier.validate_xattr_block(77, &clean),
+            XattrBlockValidation::Valid {
+                refcount: 1,
+                entry_count: 1
+            }
+        );
+
+        let mut corrupt_entry_hash = clean.clone();
+        corrupt_entry_hash[44] ^= 1;
+        assert_eq!(
+            verifier.validate_xattr_block(77, &corrupt_entry_hash),
+            XattrBlockValidation::InvalidHash
+        );
+
+        let mut corrupt_block_hash = clean;
+        corrupt_block_hash[12..16].copy_from_slice(&entry_hash.wrapping_add(1).to_le_bytes());
+        assert_eq!(
+            verifier.validate_xattr_block(77, &corrupt_block_hash),
+            XattrBlockValidation::InvalidHash
+        );
+    }
 }
 
 /// Statistics collected during inode & extent verification.
@@ -903,6 +1009,12 @@ pub struct InodeVerificationStats {
     pub extent_block_checksum_failures: AtomicU64,
     pub xattr_block_corruptions: AtomicU64,
     pub xattr_checksum_failures: AtomicU64,
+    pub xattr_blocks_checked: AtomicU64,
+    pub xattr_entries_checked: AtomicU64,
+    pub xattr_hash_failures: AtomicU64,
+    pub xattr_refcount_failures: AtomicU64,
+    pub xattr_semantic_failures: AtomicU64,
+    pub extent_metadata_overlap_failures: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -1054,6 +1166,31 @@ pub fn verify_inodes_parallel<F>(
 ) where
     F: Fn(u64) -> Option<Vec<u8>> + Sync,
 {
+    verify_inodes_parallel_with_metadata(
+        inodes,
+        first_inode_number,
+        tracker,
+        None,
+        0,
+        stats,
+        metadata_checksum,
+        read_block_fn,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_inodes_parallel_with_metadata<F>(
+    inodes: &[Ext4Inode],
+    first_inode_number: u32,
+    tracker: &BlockAllocationTracker,
+    protected_metadata: Option<&BlockAllocationTracker>,
+    metadata_owner_inode: u32,
+    stats: &InodeVerificationStats,
+    metadata_checksum: Ext4MetadataChecksum,
+    read_block_fn: &F,
+) where
+    F: Fn(u64) -> Option<Vec<u8>> + Sync,
+{
     stats
         .total_inodes_scanned
         .fetch_add(inodes.len() as u64, Ordering::Relaxed);
@@ -1084,7 +1221,12 @@ pub fn verify_inodes_parallel<F>(
             stats.extent_trees_checked.fetch_add(1, Ordering::Relaxed);
             let inode_number = first_inode_number + index as u32;
             let inode_generation = u32::from_le(inode.i_generation);
-            verify_extent_block(
+            let protected_metadata = if inode_number == metadata_owner_inode {
+                None
+            } else {
+                protected_metadata
+            };
+            verify_extent_block_with_metadata(
                 &inode.i_block,
                 ExtentTreeChecksumContext {
                     inode_number,
@@ -1093,6 +1235,7 @@ pub fn verify_inodes_parallel<F>(
                 },
                 tracker.total_blocks(),
                 tracker,
+                protected_metadata,
                 stats,
                 read_block_fn,
                 0,
@@ -1175,11 +1318,37 @@ pub fn verify_extent_block<F>(
 ) where
     F: Fn(u64) -> Option<Vec<u8>>,
 {
+    verify_extent_block_with_metadata(
+        data,
+        checksum_context,
+        max_blocks,
+        tracker,
+        None,
+        stats,
+        read_block_fn,
+        current_depth,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_extent_block_with_metadata<F>(
+    data: &[u8],
+    checksum_context: ExtentTreeChecksumContext,
+    max_blocks: u64,
+    tracker: &BlockAllocationTracker,
+    protected_metadata: Option<&BlockAllocationTracker>,
+    stats: &InodeVerificationStats,
+    read_block_fn: &F,
+    current_depth: u16,
+) where
+    F: Fn(u64) -> Option<Vec<u8>>,
+{
     let mut visited = std::collections::HashSet::new();
     let context = ExtentValidationContext {
         checksum_context,
         max_blocks,
         tracker,
+        protected_metadata,
         stats,
         read_block_fn: &read_block_fn,
     };
@@ -1196,6 +1365,7 @@ where
     checksum_context: ExtentTreeChecksumContext,
     max_blocks: u64,
     tracker: &'a BlockAllocationTracker,
+    protected_metadata: Option<&'a BlockAllocationTracker>,
     stats: &'a InodeVerificationStats,
     read_block_fn: &'a F,
 }
@@ -1319,6 +1489,13 @@ where
                     .stats
                     .out_of_bounds_blocks
                     .fetch_add(1, Ordering::Relaxed);
+            } else if context.protected_metadata.is_some_and(|metadata| {
+                (start_block..physical_end).any(|block| metadata.is_allocated(block))
+            }) {
+                context
+                    .stats
+                    .extent_metadata_overlap_failures
+                    .fetch_add(1, Ordering::Relaxed);
             } else if !context.tracker.mark_range(start_block, count) {
                 context
                     .stats
@@ -1370,6 +1547,19 @@ where
             if !visited.insert(child_block) {
                 corrupt();
                 continue;
+            }
+            if context
+                .protected_metadata
+                .is_some_and(|metadata| metadata.is_allocated(child_block))
+            {
+                context
+                    .stats
+                    .extent_metadata_overlap_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if let Some(metadata) = context.protected_metadata {
+                metadata.mark_range(child_block, 1);
             }
             if !context.tracker.mark_range(child_block, 1) {
                 context
@@ -1968,6 +2158,35 @@ mod extent_semantic_tests {
         verify_extent_block(&bytes, context(), 40_000, &tracker, &stats, &|_| None, 0);
         assert_eq!(stats.extent_corruptions.load(Ordering::Relaxed), 0);
         assert_eq!(tracker.allocated_count(), 0x8000);
+    }
+
+    #[test]
+    fn rejects_file_extent_overlapping_protected_metadata() {
+        let mut bytes = root(0, 1, 4);
+        bytes[12..16].copy_from_slice(&3u32.to_le_bytes());
+        bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&20u32.to_le_bytes());
+        let tracker = BlockAllocationTracker::new(100);
+        let protected = BlockAllocationTracker::new(100);
+        protected.mark_range(21, 1);
+        let stats = InodeVerificationStats::new();
+        verify_extent_block_with_metadata(
+            &bytes,
+            context(),
+            100,
+            &tracker,
+            Some(&protected),
+            &stats,
+            &|_| None,
+            0,
+        );
+        assert_eq!(
+            stats
+                .extent_metadata_overlap_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(tracker.allocated_count(), 0);
     }
 
     #[test]

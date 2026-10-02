@@ -23,3 +23,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --lib --bins --tests
       - run: cargo build --release --workspace
+      - name: Differential corruption regression gate
+        if: matrix.os == 'ubuntu-24.04' && matrix.toolchain == 'stable'
+        run: python3 scripts/differential_ext4.py --output /tmp/nexfsck-differential-ci.json --check-manifest

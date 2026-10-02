@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "nexfsck_must_detect": [
+    "primary_superblock_checksum",
+    "backup_superblock_checksum",
+    "group_descriptor_checksum",
+    "block_bitmap_payload",
+    "inode_bitmap_payload",
+    "inode_checksum"
+  ],
+  "known_e2fsck_disagreements": {
+    "backup_superblock_checksum": "e2fsck 1.46.5 ordinary -fn does not validate this backup copy"
+  }
+}

@@ -18,10 +18,22 @@ the underlying metadata.
 | Inode | Validated | Validated | Raw inode size, inode number, generation and checksum fields follow e2fsprogs behavior |
 | Directory leaf block | Dirents parsed, no checksum | Validated | CRC32c uses filesystem seed, inode number, generation and bytes before the fake tail |
 | HTree root/node | Structure partially validated | Checksum validated; structural validation partial | CRC32c uses inode context, occupied entry range and dx tail; real indexed-image corruption test |
-| External extent-tree block | Extents parsed, no checksum | Checksum + semantic validation, still partial | CRC32c uses inode number/generation seed and `eh_max` tail. Depth transitions, capacities, key/range ordering, zero lengths, bounds, cycles and reused child blocks are checked. Explicit metadata-block-vs-data semantics remain incomplete |
-| Extended-attribute block | Not parsed | Checksum and bounds validation; partial semantics | External value ranges/header/refcount parsed; kernel CRC32c uses filesystem seed and block number. Entry/value hashes and cross-inode shared-block refcount accounting are not verified |
+| External extent-tree block | Extents parsed, no checksum | Checksum + semantic validation, still partial | CRC32c uses inode number/generation seed and `eh_max` tail. Depth transitions, capacities, key/range ordering, zero lengths, bounds, cycles and reused child blocks are checked. File data is compared against currently tracked superblock/GDT/reserved-GDT, bitmap, inode-table, journal-inode, external extent-node and external xattr blocks; other metadata roles remain open |
+| Extended-attribute block | Not parsed | Checksum, bounds, ordering, entry/block hashes, and observed shared-reference count validated | External values must be block-local; ea_inode references remain rejected. Zero `h_hash` is accepted as ext4's “never share” sentinel; nonzero block hashes and all entry hashes use Linux/e2fsprogs algorithms. Header refcount is compared with valid-checksum inode references |
 | MMP block | Feature detected before scan | Explicitly rejected before verification | Nexfsck does not sample sequence stability across the configured MMP interval or perform the kernel/e2fsprogs ownership protocol. A single checksum-valid read cannot prove exclusive ownership; read-only and repair paths both refuse MMP filesystems |
-| JBD2 | Journal inode/superblock state parsed | Superblock structure/checksum validated; transaction coverage partial | JBD2 v3 superblock CRC32c, type, block geometry and log bounds are checked. Legacy v1 and v2 checksums, descriptor/commit/revoke transaction checksums and dirty-log replay are not implemented; dirty/recovery-required state blocks repair and is never reported clean |
+| JBD2 | Journal inode/superblock state parsed | Superblock structure/checksum validated; transactions not validated | JBD2 v3 superblock CRC32c, type, block geometry and log bounds are checked. Checksum v1/v2, async commit, descriptor/commit/revoke traversal and transaction ordering are unsupported. A journal requiring replay is not reported clean and repair is blocked; external journals are rejected |
+
+### JBD2 support matrix
+
+| Mode | Status |
+| --- | --- |
+| Checksum v1 | Rejected / not validated |
+| Checksum v2 | Rejected / not validated |
+| Checksum v3 superblock | Validated |
+| Checksum v3 transaction blocks | Not traversed or validated |
+| Async commit | Rejected / not validated |
+| 64-bit journal tags | Parsed in helper tests; transaction stream not supported |
+| External journal | Rejected |
 
 The JBD2 rules above are cross-checked against the [Linux ext4 journal format
 documentation](https://github.com/torvalds/linux/blob/master/Documentation/filesystems/ext4/journal.rst)
@@ -36,11 +48,11 @@ rule over UUID, group number and descriptor bytes excluding the checksum field.
 
 | Feature | Status | Current scope / limitation |
 | --- | --- | --- |
-| extents | Partially supported | Root/external nodes validate depth, capacity, ordering/range constraints, bounds, zero lengths, and cycles/reused children; metadata-block exclusion and full e2fsck semantic parity remain incomplete |
+| extents | Partially supported | Root/external nodes validate depth, capacity, ordering/range constraints, bounds, zero lengths, cycles/reused children, and overlap with metadata roles currently classified by Nexfsck; complete ownership and e2fsck parity remain incomplete |
 | Backup superblocks | Verification supported for current layouts | Expected backup-bearing groups are systematically located, checksummed, and compared with primary geometry/features; no replacement or primary recovery is performed |
-| External xattr blocks | Partially supported | External xattr block structure/checksum and bounds verified; semantic hashes and cross-inode refcount accounting remain unchecked |
+| External xattr blocks | Read-only verified for supported local-value format | Entry ordering/bounds, local value overlap, Linux/e2fsprogs entry hashes, nonzero block hash, checksum, and observed cross-inode reference count are checked. ea_inode remains rejected |
 | 64bit | Read-only supported | High block-address fields and descriptor sizes are parsed |
-| metadata_csum | Partially supported | Superblock, group descriptor, allocation bitmap, inode, directory/HTree, external extent and external xattr block checksums validated; xattr semantics and MMP remain incomplete |
+| metadata_csum | Partially supported | Superblock, group descriptor, allocation bitmap, inode, directory/HTree, external extent and external xattr block checksums validated; journal transaction checksums and MMP remain incomplete |
 | metadata_csum_seed | Read-only supported | Explicit checksum seed used for implemented checksum classes |
 | gdt_csum | Partially supported | Legacy group descriptor CRC16 validated |
 | sparse_super2 | Read-only supported | Backup-superblock placement follows the two explicit backup group numbers |
@@ -70,14 +82,17 @@ that no undo journal is created and the image bytes remain unchanged.
 
 The CLI reports centralized repair eligibility with stable reason codes in JSON
 and explanations in human output. Backup checksum/geometry failures, invalid
-inode/extent structure, directory/reference errors, dirty journal state, and
-storage media errors block bitmap repair. A checksum-failed filesystem may
+inode/extent structure, extent-to-protected-metadata overlap, xattr semantic or
+refcount failures, directory/reference errors, dirty journal state, and storage
+media errors block bitmap repair. A checksum-failed filesystem may
 still be scanned read-only to collect independent diagnostics.
 
 The initial differential runner is `scripts/differential_ext4.py`. Its JSON
 captures six independent mutations (primary/backup superblock checksum, group
 descriptor checksum, block/inode bitmap payload, and inode checksum), exact byte
-offsets, commands, exit codes, counters, and diagnostics. It deliberately
+offsets, commands, exit codes, parsed JSON counters, RepairTrustState reasons,
+and diagnostics. A checked-in expected-results manifest and CI gate require
+Nexfsck to keep detecting these six mutations. It deliberately
 lists the remaining metadata classes as uncovered; this is not complete
 differential parity. Current observed behavior includes e2fsck 1.46.5 exiting
 zero for a corrupted backup checksum (not checked by its ordinary `-fn` scan)

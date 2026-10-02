@@ -1,7 +1,7 @@
 //! `nexfsck` — experimental ext4 file system checker
 
 use clap::{Parser, ValueEnum};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::FileTypeExt;
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
@@ -13,9 +13,9 @@ use zerocopy::IntoBytes;
 use nexfsck_compute::{
     collect_directory_blocks, collect_inode_extents, reconcile_block_bitmap,
     reconcile_inode_bitmap, verify_directory_block_compact, verify_htree_directory,
-    verify_inodes_parallel, BitmapDiscrepancy, BlockAllocationTracker, Ext4MetadataChecksum,
-    HardwareProfile, InodeBitmapDiscrepancy, InodeChecksumResult, InodeChecksumVerifier,
-    InodeVerificationStats, XattrBlockValidation,
+    verify_inodes_parallel_with_metadata, BitmapDiscrepancy, BlockAllocationTracker,
+    Ext4MetadataChecksum, HardwareProfile, InodeBitmapDiscrepancy, InodeChecksumResult,
+    InodeChecksumVerifier, InodeVerificationStats, XattrBlockValidation,
 };
 use nexfsck_gpu::{BlockInterval, GpuAccelerator};
 use nexfsck_io::{BlockDevice, IoBackend};
@@ -230,6 +230,10 @@ enum RepairBlockReason {
     BackupGeometryConflict,
     ExtentSemanticFailure,
     XattrIntegrityFailure,
+    XattrHashFailure,
+    XattrRefcountFailure,
+    XattrSemanticFailure,
+    ExtentMetadataOverlap,
     DirectoryReferenceFailure,
     JournalIntegrityUnknown,
     JournalReplayRequired,
@@ -243,6 +247,10 @@ impl RepairBlockReason {
             Self::BackupGeometryConflict => "backup_geometry_conflict",
             Self::ExtentSemanticFailure => "extent_semantic_failure",
             Self::XattrIntegrityFailure => "xattr_integrity_failure",
+            Self::XattrHashFailure => "xattr_hash_failure",
+            Self::XattrRefcountFailure => "xattr_refcount_failure",
+            Self::XattrSemanticFailure => "xattr_semantic_failure",
+            Self::ExtentMetadataOverlap => "extent_metadata_overlap",
             Self::DirectoryReferenceFailure => "directory_reference_failure",
             Self::JournalIntegrityUnknown => "journal_integrity_unknown",
             Self::JournalReplayRequired => "journal_replay_required",
@@ -256,6 +264,12 @@ impl RepairBlockReason {
             Self::BackupGeometryConflict => "backup superblock integrity/geometry conflict",
             Self::ExtentSemanticFailure => "inode or extent structure is invalid",
             Self::XattrIntegrityFailure => "external xattr structure or read is invalid",
+            Self::XattrHashFailure => "external xattr semantic hash is invalid",
+            Self::XattrRefcountFailure => "external xattr shared reference count disagrees",
+            Self::XattrSemanticFailure => "external xattr entries are structurally invalid",
+            Self::ExtentMetadataOverlap => {
+                "file data extent overlaps protected filesystem metadata"
+            }
             Self::DirectoryReferenceFailure => "directory, symlink, or reference validation failed",
             Self::JournalIntegrityUnknown => "journal integrity is uncertain",
             Self::JournalReplayRequired => "journal replay is required and unsupported",
@@ -654,6 +668,7 @@ fn main() -> ExitCode {
 
     // 5. Initialize adaptive allocation tracking and telemetry
     let tracker = BlockAllocationTracker::new(total_blocks);
+    let protected_metadata_tracker = BlockAllocationTracker::new(total_blocks);
     let inode_stats = InodeVerificationStats::new();
     let mut stats = ProgressStats::new(bg_count);
     let live_metrics = Arc::new(LiveMetrics::new(bg_count));
@@ -678,6 +693,7 @@ fn main() -> ExitCode {
 
     if first_data_block > 0 {
         tracker.mark_range(0, first_data_block as u32);
+        protected_metadata_tracker.mark_range(0, first_data_block as u32);
     }
 
     for (bg_idx, desc) in group_descriptors.iter().enumerate() {
@@ -686,10 +702,15 @@ fn main() -> ExitCode {
             let meta_blocks =
                 (1 + gdt_blocks + reserved_gdt).min(total_blocks - first_block) as u32;
             tracker.mark_range(first_block, meta_blocks);
+            protected_metadata_tracker.mark_range(first_block, meta_blocks);
         }
         tracker.mark_range(desc.block_bitmap(is_64bit), 1);
+        protected_metadata_tracker.mark_range(desc.block_bitmap(is_64bit), 1);
         tracker.mark_range(desc.inode_bitmap(is_64bit), 1);
+        protected_metadata_tracker.mark_range(desc.inode_bitmap(is_64bit), 1);
         tracker.mark_range(desc.inode_table_block(is_64bit), inode_table_blocks as u32);
+        protected_metadata_tracker
+            .mark_range(desc.inode_table_block(is_64bit), inode_table_blocks as u32);
     }
     profile.mark("metadata_tracker_setup");
 
@@ -712,7 +733,8 @@ fn main() -> ExitCode {
     let mut inactive_inode_count = 0u64;
     let inode_checksum_verifier = InodeChecksumVerifier::new(&sb);
     let mut invalid_inode_checksums = HashSet::new();
-    let mut seen_xattr_blocks = HashSet::new();
+    // Count every inode reference, but read/validate each shared xattr block once.
+    let mut xattr_references: HashMap<u64, (u32, Option<u32>)> = HashMap::new();
     let mut xattr_validation_time = Duration::ZERO;
 
     for (bg_idx, desc) in group_descriptors.iter().enumerate() {
@@ -768,30 +790,52 @@ fn main() -> ExitCode {
                     if inode.is_used()
                         && !invalid_inode_checksums.contains(&ino_num)
                         && xattr_block != 0
-                        && seen_xattr_blocks.insert(xattr_block)
                     {
+                        let entry = xattr_references.entry(xattr_block).or_insert((0, None));
+                        entry.0 = entry.0.saturating_add(1);
                         if xattr_block >= total_blocks {
                             inode_stats
                                 .xattr_block_corruptions
                                 .fetch_add(1, Ordering::Relaxed);
                             group_had_error = true;
-                        } else {
+                        } else if entry.1.is_none() {
                             tracker.mark_range(xattr_block, 1);
+                            protected_metadata_tracker.mark_range(xattr_block, 1);
                             let started = Instant::now();
                             match dev.read_block(xattr_block, block_size) {
                                 Ok(bytes) => match metadata_checksum
                                     .validate_xattr_block(xattr_block, &bytes)
                                 {
-                                    XattrBlockValidation::Valid { .. } => {}
+                                    XattrBlockValidation::Valid {
+                                        refcount,
+                                        entry_count,
+                                    } => {
+                                        entry.1 = Some(refcount);
+                                        inode_stats
+                                            .xattr_blocks_checked
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        inode_stats
+                                            .xattr_entries_checked
+                                            .fetch_add(entry_count as u64, Ordering::Relaxed);
+                                    }
                                     XattrBlockValidation::InvalidStructure => {
                                         inode_stats
                                             .xattr_block_corruptions
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        inode_stats
+                                            .xattr_semantic_failures
                                             .fetch_add(1, Ordering::Relaxed);
                                         group_had_error = true;
                                     }
                                     XattrBlockValidation::InvalidChecksum => {
                                         inode_stats
                                             .xattr_checksum_failures
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        group_had_error = true;
+                                    }
+                                    XattrBlockValidation::InvalidHash => {
+                                        inode_stats
+                                            .xattr_hash_failures
                                             .fetch_add(1, Ordering::Relaxed);
                                         group_had_error = true;
                                     }
@@ -817,6 +861,17 @@ fn main() -> ExitCode {
                             directory_blocks_to_check.push((ino_num, blk));
                         }
                     }
+                    if inode.is_used()
+                        && ino_num == u32::from_le(sb.s_journal_inum)
+                        && inode.uses_extents()
+                        && !inode.is_inline_data()
+                    {
+                        for (start_block, block_count) in collect_inode_extents(inode, &|blk| {
+                            dev.read_block(blk, block_size).ok()
+                        }) {
+                            protected_metadata_tracker.mark_range(start_block, block_count);
+                        }
+                    }
                     if inode.is_used() && inode.uses_extents() && !inode.is_inline_data() {
                         compute_intervals.extend(
                             collect_inode_extents(inode, &|blk| {
@@ -833,10 +888,12 @@ fn main() -> ExitCode {
                 inode_metadata_collection_time += operation_started.elapsed();
 
                 let operation_started = Instant::now();
-                verify_inodes_parallel(
+                verify_inodes_parallel_with_metadata(
                     &inodes,
                     first_inode,
                     &tracker,
+                    Some(&protected_metadata_tracker),
+                    u32::from_le(sb.s_journal_inum),
                     &inode_stats,
                     metadata_checksum,
                     &|blk| dev.read_block(blk, block_size).ok(),
@@ -947,6 +1004,17 @@ fn main() -> ExitCode {
                 inode_stats
                     .corrupt_directories
                     .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if invalid_inode_checksums.is_empty() {
+        for (observed, header_refcount) in xattr_references.values() {
+            if let Some(header_refcount) = header_refcount {
+                if observed != header_refcount {
+                    inode_stats
+                        .xattr_refcount_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1218,6 +1286,14 @@ fn main() -> ExitCode {
         .load(Ordering::Relaxed);
     let xattr_block_corruptions = inode_stats.xattr_block_corruptions.load(Ordering::Relaxed);
     let xattr_checksum_failures = inode_stats.xattr_checksum_failures.load(Ordering::Relaxed);
+    let xattr_blocks_checked = inode_stats.xattr_blocks_checked.load(Ordering::Relaxed);
+    let xattr_entries_checked = inode_stats.xattr_entries_checked.load(Ordering::Relaxed);
+    let xattr_hash_failures = inode_stats.xattr_hash_failures.load(Ordering::Relaxed);
+    let xattr_refcount_failures = inode_stats.xattr_refcount_failures.load(Ordering::Relaxed);
+    let xattr_semantic_failures = inode_stats.xattr_semantic_failures.load(Ordering::Relaxed);
+    let extent_metadata_overlaps = inode_stats
+        .extent_metadata_overlap_failures
+        .load(Ordering::Relaxed);
     let checksum_failures = inode_checksum_failures
         + block_bitmap_checksum_failures
         + inode_bitmap_checksum_failures
@@ -1239,8 +1315,20 @@ fn main() -> ExitCode {
     if corruptions + duplicates + oob != 0 {
         repair_trust.block(RepairBlockReason::ExtentSemanticFailure);
     }
+    if extent_metadata_overlaps != 0 {
+        repair_trust.block(RepairBlockReason::ExtentMetadataOverlap);
+    }
     if xattr_block_corruptions != 0 {
         repair_trust.block(RepairBlockReason::XattrIntegrityFailure);
+    }
+    if xattr_hash_failures != 0 {
+        repair_trust.block(RepairBlockReason::XattrHashFailure);
+    }
+    if xattr_refcount_failures != 0 {
+        repair_trust.block(RepairBlockReason::XattrRefcountFailure);
+    }
+    if xattr_semantic_failures != 0 {
+        repair_trust.block(RepairBlockReason::XattrSemanticFailure);
     }
     if corrupt_symlinks + corrupt_dirs + orphan_dirs + link_mismatches != 0 {
         repair_trust.block(RepairBlockReason::DirectoryReferenceFailure);
@@ -1269,8 +1357,12 @@ fn main() -> ExitCode {
         + extent_block_checksum_failures
         + xattr_block_corruptions
         + xattr_checksum_failures
+        + xattr_hash_failures
+        + xattr_refcount_failures
+        + extent_metadata_overlaps
         + backup_superblock_failures
         + journal_integrity_failures
+        + u64::from(journal_is_dirty)
         + total_block_discrepancy.false_free_blocks
         + total_inode_discrepancy.false_free_inodes
         + media_errors;
@@ -1505,6 +1597,21 @@ fn main() -> ExitCode {
         println!(
             "  \"xattr_checksum_failures\": {},",
             xattr_checksum_failures
+        );
+        println!("  \"xattr_blocks_checked\": {},", xattr_blocks_checked);
+        println!("  \"xattr_entries_checked\": {},", xattr_entries_checked);
+        println!("  \"xattr_hash_failures\": {},", xattr_hash_failures);
+        println!(
+            "  \"xattr_refcount_failures\": {},",
+            xattr_refcount_failures
+        );
+        println!(
+            "  \"xattr_semantic_failures\": {},",
+            xattr_semantic_failures
+        );
+        println!(
+            "  \"extent_metadata_overlap_failures\": {},",
+            extent_metadata_overlaps
         );
         println!("  \"extent_corruptions\": {},", corruptions);
         println!("  \"duplicate_blocks\": {},", duplicates);

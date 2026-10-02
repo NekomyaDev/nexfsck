@@ -663,6 +663,9 @@ fn test_external_xattr_block_integrity_oracle() {
     assert_eq!(code, 0, "{clean_json}");
     assert!(clean_json.contains("\"xattr_block_corruptions\": 0"));
     assert!(clean_json.contains("\"xattr_checksum_failures\": 0"));
+    assert!(clean_json.contains("\"xattr_blocks_checked\": 1"));
+    assert!(clean_json.contains("\"xattr_entries_checked\": 1"));
+    assert!(clean_json.contains("\"xattr_hash_failures\": 0"));
     assert!(Command::new("e2fsck")
         .args(["-f", "-n", image.to_str().unwrap()])
         .status()
