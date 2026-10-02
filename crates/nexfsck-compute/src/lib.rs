@@ -400,6 +400,7 @@ impl Ext4MetadataChecksum {
     }
 }
 
+#[allow(unknown_lints)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn ext4_xattr_entry_hash(name: &[u8], padded_value: &[u8]) -> u32 {
     const NAME_SHIFT: u32 = 5;
