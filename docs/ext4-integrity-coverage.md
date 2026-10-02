@@ -18,7 +18,7 @@ the underlying metadata.
 | Inode | Validated | Validated | Raw inode size, inode number, generation and checksum fields follow e2fsprogs behavior |
 | Directory leaf block | Dirents parsed, no checksum | Validated | CRC32c uses filesystem seed, inode number, generation and bytes before the fake tail |
 | HTree root/node | Structure partially validated | Checksum validated; structural validation partial | CRC32c uses inode context, occupied entry range and dx tail; real indexed-image corruption test |
-| External extent-tree block | Extents parsed, no checksum | Checksum + semantic validation, still partial | CRC32c uses inode number/generation seed and `eh_max` tail. Depth transitions, capacities, key/range ordering, zero lengths, bounds, cycles and reused child blocks are checked. File data is compared against tracked superblock/GDT/reserved-GDT, bitmap, inode-table, journal-inode, external extent-node and external xattr blocks. Metadata discovery is descriptor-driven for bitmap/inode-table placement (including flex_bg), but backup/GDT variants and all metadata roles are not yet independently proven complete |
+| External extent-tree block | Extents parsed, no checksum | Checksum + semantic validation, still partial | CRC32c uses inode number/generation seed and `eh_max` tail. Depth transitions, capacities, key/range ordering, zero lengths, bounds, cycles and reused child blocks are checked. File data is compared against tracked superblock/GDT/reserved-GDT, bitmap, inode-table, journal-inode, external extent-node and external xattr blocks. Descriptor-driven bitmap/inode-table placement handles flex_bg; broad layout and external-node alias differential coverage remain incomplete |
 | Extended-attribute block | Not parsed | Checksum, bounds, ordering, entry/block hashes, and observed shared-reference count validated | External values must be block-local; ea_inode references remain rejected. Zero `h_hash` is accepted as ext4's “never share” sentinel; nonzero block hashes and all entry hashes use Linux/e2fsprogs algorithms. Header refcount is compared with checksum-valid inode references. Real-image xattr differential coverage is present; e2fsck may not diagnose every nonzero semantic hash mutation in read-only mode |
 | MMP block | Feature detected before scan | Explicitly rejected before verification | Nexfsck does not sample sequence stability across the configured MMP interval or perform the kernel/e2fsprogs ownership protocol. A single checksum-valid read cannot prove exclusive ownership; read-only and repair paths both refuse MMP filesystems |
 | JBD2 | Journal inode/superblock state parsed | V3 superblock and bounded active transaction scan are verification-only | The internal journal inode is extent-mapped with bounds checks. CRC32c v3 descriptor/commit blocks, tags/data checksums, revoke bounds/checksum helpers, sequence continuity and incomplete tails are checked. V1/v2, async commit, external journal, and replay are rejected. Real descriptor+commit path coverage exists; a real revoke transaction remains unavailable |
@@ -43,8 +43,12 @@ superblock, and its external xattr block. Each must increment
 `extent_metadata_overlap_failures`, block repair, and preserve the image on a
 repair attempt. Superblock block zero itself is not used as a data target
 because ext4 reserves physical block zero and the checker independently treats
-it as an invalid data address; external extent-node overlap is not yet in this
-real-image mutation set.
+it as an invalid data address. External extent-node ownership is tracked, but
+the differential suite does not yet redirect file data into such a node. The
+extent differential cases cover root magic, zero length, logical ordering and
+overlap, invalid depth transition, plus the six ownership targets above; they
+do not yet cover external-node checksum corruption, reused children, cycles,
+or invalid external child blocks.
 
 ### JBD2 support matrix
 
@@ -71,9 +75,13 @@ The differential runner creates a disposable ext4 image mounted with
 `commit=600,data=journal`, writes and fsyncs a file, then snapshots before
 unmount. The captured active transaction had sequence 2, one descriptor, five
 data blocks, and a commit; Nexfsck reported one committed transaction and kept
-repair ineligible because replay is not implemented. The runner compares each
-mutation against the dirty active baseline so the baseline's own non-clean
-status is not mistaken for mutation detection.
+repair ineligible because replay is not implemented. A separate attempt wrote
+and fsynced an 8 MiB file, unlinked it, then snapshotted before unmount; the
+kernel journal contained descriptors and commits but no revoke block. Real
+revoke cases therefore remain unavailable; only bounded parser/helper tests
+cover revoke records. The differential runner compares each mutation against
+the dirty active baseline so the baseline's own non-clean status is not
+mistaken for mutation detection.
 
 The JBD2 rules above are cross-checked against the [Linux ext4 journal format
 documentation](https://github.com/torvalds/linux/blob/master/Documentation/filesystems/ext4/journal.rst)
@@ -127,14 +135,17 @@ refcount failures, directory/reference errors, dirty journal state, and storage
 media errors block bitmap repair. A checksum-failed filesystem may
 still be scanned read-only to collect independent diagnostics.
 
-The differential runner is `scripts/differential_ext4.py`. It currently creates
-six base corruption cases, two real extent-to-metadata overlap cases, and
-eleven real external-xattr cases, including a kernel-created shared xattr block when loop-mount tooling is available. The
-JSON captures parsed Nexfsck counters, repair trust reasons, source/binary
-identity, both commands and exit statuses, and e2fsck diagnostics. A checked-in
-expected-results manifest and CI gate require Nexfsck to retain required
-detections and counters. Remaining extent-metadata-overlap, broad directory,
-and JBD2 transaction cases are not yet in the machine-run differential suite;
-this is not complete differential parity. Observed e2fsck 1.46.5 differences
-include ordinary `-fn` exiting zero for a corrupted backup checksum and for a
-nonzero xattr semantic block hash that Nexfsck rejects.
+The current authoritative differential source is the runner and its
+`not_yet_covered` field; results must be generated against a committed source
+and binary before publication. The latest in-progress run from this working
+tree defines 39 cases, executes 37, and marks the two real-revoke cases
+unavailable. It includes six base checksum cases, five checksum-preserving
+extent-root mutations, six extent-to-metadata mutations, eleven xattr
+mutations, and nine JBD2 mutations. It does not yet contain directory/HTree
+corruption mutations or external extent-node checksum/reuse/cycle/overlap
+mutations. A checked-in expected-results manifest gates detections/counters;
+this remains incomplete differential coverage, not complete e2fsck parity.
+Known e2fsck 1.46.5 differences include ordinary `-fn` not reporting a backup
+superblock checksum or a nonzero xattr semantic block hash that Nexfsck rejects,
+and several active-JBD2 mutations that Nexfsck rejects while `-fn` does not
+report the mutation relative to the dirty baseline.

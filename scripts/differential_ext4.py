@@ -19,12 +19,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MISSING_CASES = [
-    "extent_root_header", "extent_invalid_length", "extent_logical_overlap",
     "external_extent_node_checksum", "extent_child_reuse", "extent_cycle",
-    "extent_overlap_inode_table", "extent_overlap_superblock_gdt",
-    "extent_overlap_extent_node", "extent_overlap_xattr_block",
-    "directory_rec_len", "directory_block_boundary", "directory_inode_reference",
-    "directory_checksum", "htree_checksum", "htree_child_bounds", "htree_ordering",
+    "extent_overlap_extent_node", "directory_rec_len", "directory_block_boundary",
+    "directory_inode_reference", "directory_checksum", "htree_checksum",
+    "htree_child_bounds", "htree_ordering",
     "jbd2_revoke_checksum", "jbd2_revoke_length", "extent_external_node_overlap",
     "mmp",
 ]
@@ -402,8 +400,8 @@ def inode_checksum_offset(image):
     return block * block_size + within + 124
 
 
-def mutate_inode_extent_target(image, inode_number, target_block):
-    """Redirect the first extent while preserving a valid inode checksum."""
+def mutate_raw_inode(image, inode_number, mutate):
+    """Mutate raw inode bytes and recompute its metadata_csum checksum."""
     _, block_size, _, _, _, _ = parse_dumpe2fs(image)
     header = run(["dumpe2fs", "-h", str(image)])
     inode_size = int(re.search(r"Inode size:\s*(\d+)", header.stdout).group(1))
@@ -438,8 +436,7 @@ def mutate_inode_extent_target(image, inode_number, target_block):
             raise RuntimeError(
                 f"cannot independently verify source inode checksum: calculated {original_calculated:#x}, stored {original_stored:#x}"
             )
-        inode[58:60] = ((target_block >> 32) & 0xffff).to_bytes(2, "little")
-        inode[60:64] = (target_block & 0xffffffff).to_bytes(4, "little")
+        mutate(inode)
         inode[124:126] = b"\0\0"
         if inode_size >= 132:
             inode[130:132] = b"\0\0"
@@ -451,6 +448,42 @@ def mutate_inode_extent_target(image, inode_number, target_block):
         stream.write(inode)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def mutate_inode_extent_target(image, inode_number, target_block):
+    """Redirect the first extent while preserving a valid inode checksum."""
+    def apply(inode):
+        inode[58:60] = ((target_block >> 32) & 0xffff).to_bytes(2, "little")
+        inode[60:64] = (target_block & 0xffffffff).to_bytes(4, "little")
+
+    mutate_raw_inode(image, inode_number, apply)
+
+
+def mutate_extent_root(image, inode_number, mutation):
+    def apply(inode):
+        if inode[40:42] != b"\x0a\xf3":
+            raise RuntimeError("target inode does not have an extent root")
+        if mutation == "bad_magic":
+            inode[40:42] = b"\0\0"
+        elif mutation == "zero_length":
+            inode[56:58] = b"\0\0"
+        elif mutation in ("unsorted", "overlap"):
+            first = bytearray(inode[52:64])
+            second = bytearray(first)
+            inode[42:44] = (2).to_bytes(2, "little")
+            if mutation == "unsorted":
+                first[0:4] = (1).to_bytes(4, "little")
+                second[0:4] = (0).to_bytes(4, "little")
+            else:
+                second[0:4] = first[0:4]
+            inode[52:64] = first
+            inode[64:76] = second
+        elif mutation == "depth_transition":
+            inode[46:48] = (1).to_bytes(2, "little")
+        else:
+            raise ValueError(f"unknown extent-root mutation: {mutation}")
+
+    mutate_raw_inode(image, inode_number, apply)
 
 
 def make_extent_overlap_fixture(image, work):
@@ -588,6 +621,32 @@ def main():
             raise RuntimeError(
                 f"generated extent-overlap fixture is not clean: {clean_extent.stdout}{clean_extent.stderr}"
             )
+        for case_id, mutation_name in (
+            ("extent_root_header", "bad_magic"),
+            ("extent_invalid_length", "zero_length"),
+            ("extent_logical_ordering", "unsorted"),
+            ("extent_logical_overlap", "overlap"),
+            ("extent_invalid_depth_transition", "depth_transition"),
+        ):
+            image = work / f"{case_id}.ext4"
+            shutil.copyfile(extent_clean, image)
+            mutate_extent_root(image, extent_inode, mutation_name)
+            record = run_differential_case(
+                binary, image, case_id, "extent_structure", extent_fixture_hash,
+                {"inode": extent_inode, "mutation": mutation_name,
+                 "operation": "mutate extent-root bytes and recompute inode checksum"},
+                source_commit, binary_hash,
+            )
+            counters = record["nexfsck"]["structured_counters"] or {}
+            if case_id != "extent_invalid_depth_transition":
+                record["expected_counter"] = "extent_corruptions"
+                record["counter_observed"] = counters.get("extent_corruptions", 0)
+            else:
+                record["note"] = (
+                    "This mutation is detected through invalid child-block semantics; "
+                    "the current aggregate extent_corruptions counter is not incremented on that path."
+                )
+            records.append(record)
         for metadata_class in (
             "block_bitmap", "inode_bitmap", "inode_table", "gdt", "backup_superblock"
         ):
@@ -961,9 +1020,26 @@ def main():
             "clean_fixture_preserved": True,
             "source_binary_sha256": binary_hash,
             "cases": records,
+            "cases_defined": len(records) + len(unavailable_cases),
+            "cases_executed": len(records),
+            "cases_unavailable": len(unavailable_cases),
             "unavailable_cases": unavailable_cases,
+            "revoke_real_fixture_status": {
+                "status": "unavailable",
+                "attempted_method": (
+                    "Disposable ext4 image mounted with data=journal,commit=600; "
+                    "write and fsync an 8 MiB file, unlink it, fsync a second file, "
+                    "then snapshot before unmount and inspect debugfs logdump."
+                ),
+                "result": "debugfs found descriptor/commit transactions but no revoke block",
+                "synthetic_coverage": "JBD2 revoke bounds and checksum parser tests remain enabled",
+                "limitation": "real internal-journal revoke transaction coverage is absent",
+            },
             "not_yet_covered": MISSING_CASES,
             "summary": {
+                "cases_defined": len(records) + len(unavailable_cases),
+                "cases_executed": len(records),
+                "cases_unavailable": len(unavailable_cases),
                 "total": len(records),
                 "agreement": sum(case["agreement"] for case in records),
                 "disagreement": sum(not case["agreement"] for case in records),
@@ -972,9 +1048,9 @@ def main():
                     for name in (
                         "both_detect", "nexfsck_only_detects", "e2fsck_only_detects",
                         "both_accept", "scope_difference", "behavior_difference",
-                        "manual_review_required",
+                        "manual_review_required", "unavailable",
                     )
-                },
+                } | {"unavailable": len(unavailable_cases)},
                 "unavailable": len(unavailable_cases),
             },
         }

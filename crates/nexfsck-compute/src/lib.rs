@@ -356,8 +356,11 @@ impl Ext4MetadataChecksum {
                 &[][..]
             } else {
                 value_ranges.push((*value_offset, *value_offset + padded));
-                let hashed_size = *value_size & !3;
-                &block[*value_offset..*value_offset + hashed_size]
+                // ext4 hashes the value as little-endian 32-bit words after
+                // rounding its on-disk size up to a word boundary. The bytes
+                // between value_size and that boundary are part of the stored
+                // value area (normally zero padding) and must be included.
+                &block[*value_offset..*value_offset + padded]
             };
             let calculated = ext4_xattr_entry_hash(name, value);
             if *stored_hash != calculated {
@@ -982,6 +985,33 @@ mod crc_tests {
             XattrBlockValidation::InvalidHash
         );
     }
+
+    #[test]
+    fn external_xattr_hash_includes_on_disk_word_padding() {
+        let mut sb = test_superblock(256, None);
+        sb.s_feature_ro_compat = 0;
+        let verifier = Ext4MetadataChecksum::new(&sb);
+        let mut block = valid_xattr_block(&sb, 77);
+        block[16..20].fill(0);
+        block[40..44].copy_from_slice(&3u32.to_le_bytes());
+        block[4088..4092].copy_from_slice(b"xyz\0");
+        let hash = ext4_xattr_entry_hash(b"a", b"xyz\0");
+        block[44..48].copy_from_slice(&hash.to_le_bytes());
+        block[12..16].copy_from_slice(&hash.to_le_bytes());
+        assert_eq!(
+            verifier.validate_xattr_block(77, &block),
+            XattrBlockValidation::Valid {
+                refcount: 1,
+                entry_count: 1,
+            }
+        );
+
+        block[4091] ^= 1;
+        assert_eq!(
+            verifier.validate_xattr_block(77, &block),
+            XattrBlockValidation::InvalidHash
+        );
+    }
 }
 
 /// Statistics collected during inode & extent verification.
@@ -1005,8 +1035,12 @@ pub struct InodeVerificationStats {
     pub corrupt_directories: AtomicU64,
     pub orphan_directories: AtomicU64,
     pub link_count_mismatches: AtomicU64,
+    pub inode_checksum_validations: AtomicU64,
     pub inode_checksum_failures: AtomicU64,
+    pub directory_checksum_validations: AtomicU64,
     pub directory_checksum_failures: AtomicU64,
+    pub directory_structural_failures: AtomicU64,
+    pub htree_structural_failures: AtomicU64,
     pub extent_block_checksum_failures: AtomicU64,
     pub xattr_block_corruptions: AtomicU64,
     pub xattr_checksum_failures: AtomicU64,

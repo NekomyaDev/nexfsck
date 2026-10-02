@@ -787,6 +787,9 @@ fn main() -> ExitCode {
                 let first_inode = (bg_idx as u32) * sb.inodes_per_group() + 1;
                 let operation_started = Instant::now();
                 for (index, raw_inode) in table_bytes.chunks_exact(inode_size).enumerate() {
+                    inode_stats
+                        .inode_checksum_validations
+                        .fetch_add(1, Ordering::Relaxed);
                     if matches!(
                         inode_checksum_verifier.verify(first_inode + index as u32, raw_inode),
                         InodeChecksumResult::Invalid { .. }
@@ -1083,10 +1086,14 @@ fn main() -> ExitCode {
         inode_stats
             .corrupt_directories
             .fetch_add(htree.errors.len() as u64, Ordering::Relaxed);
+        inode_stats
+            .htree_structural_failures
+            .fetch_add(htree.errors.len() as u64, Ordering::Relaxed);
     }
     let htree_time = htree_started.elapsed();
 
     let dirent_started = Instant::now();
+    let directory_blocks_checked = directory_blocks_to_check.len() as u64;
     let mut directory_checksum_time = Duration::ZERO;
     for (_dir_ino, dir_block) in directory_blocks_to_check {
         if let Some(block_bytes) = block_cache.get(&dir_block) {
@@ -1095,6 +1102,9 @@ fn main() -> ExitCode {
                 .is_some_and(|(layout, indexed)| *indexed && layout.first() == Some(&dir_block));
             let generation = inode_generations.get(&_dir_ino).copied().unwrap_or(0);
             let checksum_started = Instant::now();
+            inode_stats
+                .directory_checksum_validations
+                .fetch_add(1, Ordering::Relaxed);
             let checksum_valid = metadata_checksum.verify_directory_block(
                 _dir_ino,
                 generation,
@@ -1112,6 +1122,9 @@ fn main() -> ExitCode {
             if res.corrupt_entries > 0 {
                 inode_stats
                     .corrupt_directories
+                    .fetch_add(res.corrupt_entries, Ordering::Relaxed);
+                inode_stats
+                    .directory_structural_failures
                     .fetch_add(res.corrupt_entries, Ordering::Relaxed);
             }
             for entry in res.entries {
@@ -1314,7 +1327,13 @@ fn main() -> ExitCode {
     let corrupt_symlinks = inode_stats.corrupted_symlinks.load(Ordering::Relaxed);
     let orphan_dirs = inode_stats.orphan_directories.load(Ordering::Relaxed);
     let link_mismatches = inode_stats.link_count_mismatches.load(Ordering::Relaxed);
+    let inode_checksum_validations = inode_stats
+        .inode_checksum_validations
+        .load(Ordering::Relaxed);
     let inode_checksum_failures = inode_stats.inode_checksum_failures.load(Ordering::Relaxed);
+    let directory_checksum_validations = inode_stats
+        .directory_checksum_validations
+        .load(Ordering::Relaxed);
     let block_bitmap_checksum_failures = inode_stats
         .block_bitmap_checksum_failures
         .load(Ordering::Relaxed);
@@ -1323,6 +1342,12 @@ fn main() -> ExitCode {
         .load(Ordering::Relaxed);
     let directory_checksum_failures = inode_stats
         .directory_checksum_failures
+        .load(Ordering::Relaxed);
+    let directory_structural_failures = inode_stats
+        .directory_structural_failures
+        .load(Ordering::Relaxed);
+    let htree_structural_failures = inode_stats
+        .htree_structural_failures
         .load(Ordering::Relaxed);
     let extent_block_checksum_failures = inode_stats
         .extent_block_checksum_failures
@@ -1587,13 +1612,33 @@ fn main() -> ExitCode {
         );
         println!("  \"allocated_blocks\": {},", tracker.allocated_count());
         println!("  \"directory_entries\": {},", total_dentry_count);
+        println!(
+            "  \"directory_blocks_checked\": {},",
+            directory_blocks_checked
+        );
+        println!(
+            "  \"directory_structural_failures\": {},",
+            directory_structural_failures
+        );
+        println!(
+            "  \"htree_structural_failures\": {},",
+            htree_structural_failures
+        );
         println!("  \"extent_intervals\": {},", compute_intervals.len());
         println!("  \"corrupt_directories\": {},", corrupt_dirs);
         println!("  \"orphan_directories\": {},", orphan_dirs);
         println!("  \"link_count_mismatches\": {},", link_mismatches);
         println!(
+            "  \"inode_checksum_validations\": {},",
+            inode_checksum_validations
+        );
+        println!(
             "  \"inode_checksum_failures\": {},",
             inode_checksum_failures
+        );
+        println!(
+            "  \"directory_checksum_validations\": {},",
+            directory_checksum_validations
         );
         println!("  \"superblock_checksum_failures\": 0,");
         println!(

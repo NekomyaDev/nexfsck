@@ -88,13 +88,26 @@ def source_provenance():
         ),
     }
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 def percentile(values, fraction):
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1, max(0, int(len(ordered) * fraction + 0.999999) - 1))]
 
 def timed_run(command):
     started = time.perf_counter()
-    proc = subprocess.run(command, capture_output=True, text=True)
+    proc = subprocess.run(
+        ["/usr/bin/time", "-f", "NEXFSCK_PEAK_RSS_KIB=%M", *command],
+        capture_output=True,
+        text=True,
+    )
+    match = re.search(r"NEXFSCK_PEAK_RSS_KIB=(\d+)", proc.stderr)
+    proc.peak_rss_kib = int(match.group(1)) if match else None
     return proc, time.perf_counter() - started
 
 def populate_filesystem():
@@ -194,6 +207,8 @@ def run_ground_truth_test():
     print(f"Running {COMPARISON_RUNS} interleaved warm-cache repetitions per checker...")
     e2_times = []
     nex_times = []
+    e2_rss_kib = []
+    nex_rss_kib = []
     p_e2 = None
     p_nex = None
     os.makedirs(RESULT_DIR, exist_ok=True)
@@ -204,6 +219,8 @@ def run_ground_truth_test():
         assert p_nex.returncode == 0, f"nexfsck comparison run {run} failed"
         e2_times.append(e2_elapsed)
         nex_times.append(nex_elapsed)
+        e2_rss_kib.append(p_e2.peak_rss_kib)
+        nex_rss_kib.append(p_nex.peak_rss_kib)
         print(f"  [Run {run:02d}/{COMPARISON_RUNS}] e2fsck={e2_elapsed:.3f}s nexfsck={nex_elapsed:.3f}s")
     with open(f"{RESULT_DIR}/e2fsck.stdout.log", "w") as f:
         f.write(p_e2.stdout)
@@ -272,6 +289,8 @@ def run_ground_truth_test():
         "cache_policy": "interleaved warm-cache; no global cache drop",
         "e2fsck_seconds": e2_times,
         "nexfsck_seconds": nex_times,
+        "e2fsck_peak_rss_kib": e2_rss_kib,
+        "nexfsck_peak_rss_kib": nex_rss_kib,
         "e2fsck_median_seconds": e2_median,
         "nexfsck_median_seconds": nex_median,
         "e2fsck_p95_seconds": percentile(e2_times, 0.95),
@@ -294,15 +313,18 @@ def run_backend_matrix():
     print("CONTROLLED BACKEND MATRIX (10 INTERLEAVED WARM-CACHE RUNS)")
     print("=" * 70)
     samples = {name: [] for name in BACKEND_MODES}
+    rss_samples = {name: [] for name in BACKEND_MODES}
     for run in range(1, COMPARISON_RUNS + 1):
         for name, flags in BACKEND_MODES.items():
             proc, elapsed = timed_run([NEXFSCK_BIN, "--json", "-n", *flags, IMG_PATH])
             assert proc.returncode == 0, f"{name} run {run} failed"
             samples[name].append(elapsed)
+            rss_samples[name].append(proc.peak_rss_kib)
     result = {}
     for name, values in samples.items():
         result[name] = {
             "seconds": values,
+            "peak_rss_kib": rss_samples[name],
             "median_seconds": statistics.median(values),
             "p95_seconds": percentile(values, 0.95),
             "stddev_seconds": statistics.pstdev(values),
@@ -513,6 +535,17 @@ def main():
                 "symlinks_requested": 2000,
                 "hardlinks_requested": 1000,
                 "block_size": 4096,
+                "sha256": sha256_file(IMG_PATH),
+            },
+            "commands": {
+                "fixture_creation": "truncate -s 10G <regular-image>; mkfs.ext4 -F -b 4096 -O 64bit,dir_index,extents <regular-image>; populate via loop mount",
+                "e2fsck_comparison": "e2fsck -f -v -t -n <fixture>",
+                "nexfsck_comparison": "nexfsck -n <fixture>",
+                "nexfsck_backend_matrix": {
+                    name: ["nexfsck", "--json", "-n", *flags, "<fixture>"]
+                    for name, flags in BACKEND_MODES.items()
+                },
+                "nexfsck_endurance": "nexfsck --json -n <fixture> (30 passes)",
             },
             "environment": {
                 "kernel": platform.release(),
