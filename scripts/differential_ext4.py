@@ -23,9 +23,10 @@ MISSING_CASES = [
     "external_extent_node_checksum", "extent_child_reuse", "extent_cycle",
     "extent_overlap_inode_table", "extent_overlap_superblock_gdt",
     "extent_overlap_extent_node", "extent_overlap_xattr_block",
-    "directory_rec_len", "directory_inode_reference", "directory_checksum",
-    "htree_checksum", "htree_child_bounds", "jbd2_descriptor", "jbd2_commit",
-    "jbd2_revoke", "mmp",
+    "directory_rec_len", "directory_block_boundary", "directory_inode_reference",
+    "directory_checksum", "htree_checksum", "htree_child_bounds", "htree_ordering",
+    "jbd2_revoke_checksum", "jbd2_revoke_length", "extent_external_node_overlap",
+    "mmp",
 ]
 MANIFEST = ROOT / "scripts/differential_expected.json"
 
@@ -145,6 +146,123 @@ def make_shared_xattr_fixture(image, work):
     return first, None
 
 
+def make_active_journal_fixture(image, work):
+    """Capture an actual committed v3 transaction from a disposable mounted ext4 image."""
+    mountpoint = work / "active-journal-mount"
+    mountpoint.mkdir()
+    active = work / "active-journal.ext4"
+    subprocess.check_call(["truncate", "-s", "256M", str(image)])
+    subprocess.check_call(["mkfs.ext4", "-q", "-F", "-O", "metadata_csum", str(image)])
+    mounted = False
+    try:
+        subprocess.check_call([
+            "sudo", "-n", "mount", "-o", "loop,commit=600,data=journal",
+            str(image), str(mountpoint),
+        ])
+        mounted = True
+        path = mountpoint / "journal-transaction"
+        subprocess.check_call(["sudo", "-n", "touch", str(path)])
+        subprocess.check_call(["sudo", "-n", "sync", "-f", str(path)])
+        # Snapshot before unmount checkpoints/clears the committed log.
+        subprocess.check_call(["sudo", "-n", "cp", "--reflink=never", str(image), str(active)])
+    except (OSError, subprocess.CalledProcessError) as error:
+        return None, f"cannot create active journal fixture safely: {error}"
+    finally:
+        if mounted:
+            subprocess.run(["sudo", "-n", "umount", str(mountpoint)], check=False)
+
+    info = journal_fixture_layout(active)
+    if info["start"] == 0:
+        return None, "mounted ext4 snapshot did not retain an active journal transaction"
+    active_hash = sha256_file(active)
+    clean_hash = sha256_file(image)
+    return (active, info, active_hash, clean_hash), None
+
+
+def journal_fixture_layout(image):
+    block_size = parse_dumpe2fs(image)[1]
+    journal_stat = run(["dumpe2fs", "-h", str(image)])
+    match = re.search(r"Journal inode:\s*(\d+)", journal_stat.stdout + journal_stat.stderr)
+    if not match:
+        raise RuntimeError("cannot locate internal journal inode")
+    journal_inode = int(match.group(1))
+    superblock_physical = int(run([
+        "debugfs", "-R", f"bmap <{journal_inode}> 0", str(image)
+    ]).stdout.strip().splitlines()[-1])
+    with image.open("rb") as stream:
+        stream.seek(superblock_physical * block_size)
+        journal_superblock = stream.read(block_size)
+    start = int.from_bytes(journal_superblock[28:32], "big")
+    maxlen = int.from_bytes(journal_superblock[16:20], "big")
+    first = int.from_bytes(journal_superblock[20:24], "big")
+    uuid = journal_superblock[48:64]
+    if not start or not first <= start < maxlen:
+        return {"journal_inode": journal_inode, "start": start, "maxlen": maxlen,
+                "first": first, "uuid": uuid, "block_size": block_size,
+                "superblock_physical": superblock_physical}
+    logdump = run(["debugfs", "-R", "logdump", str(image)])
+    text = logdump.stdout + logdump.stderr
+    descriptors = [int(value) for value in re.findall(
+        r"type 1 \(descriptor block\) at block (\d+)", text
+    )]
+    commits = [int(value) for value in re.findall(
+        r"type 2 \(commit block\) at block (\d+)", text
+    )]
+    revokes = [int(value) for value in re.findall(
+        r"type 5 \(revoke block\) at block (\d+)", text
+    )]
+    return {
+        "journal_inode": journal_inode,
+        "start": start,
+        "maxlen": maxlen,
+        "first": first,
+        "uuid": uuid,
+        "block_size": block_size,
+        "superblock_physical": superblock_physical,
+        "descriptor_logicals": descriptors,
+        "commit_logicals": commits,
+        "revoke_logicals": revokes,
+        "journal_superblock": journal_superblock,
+    }
+
+
+def journal_physical_block(image, info, logical):
+    result = run([
+        "debugfs", "-R", f"bmap <{info['journal_inode']}> {logical}", str(image)
+    ])
+    return int(result.stdout.strip().splitlines()[-1])
+
+
+def refresh_jbd_block_checksum(image, physical, block_size, uuid, checksum_offset):
+    with image.open("r+b") as stream:
+        stream.seek(physical * block_size)
+        block = bytearray(stream.read(block_size))
+        block[checksum_offset:checksum_offset + 4] = bytes(4)
+        checksum = crc32c(crc32c(0xFFFFFFFF, uuid), block)
+        stream.seek(physical * block_size + checksum_offset)
+        stream.write(checksum.to_bytes(4, "big"))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def last_jbd_v3_tag_flags_offset(image, physical, block_size):
+    with image.open("rb") as stream:
+        stream.seek(physical * block_size)
+        block = stream.read(block_size)
+    cursor = 12
+    limit = block_size - 4
+    last_flags = None
+    while cursor + 16 <= limit:
+        flags = int.from_bytes(block[cursor + 4:cursor + 8], "big")
+        last_flags = cursor + 4
+        cursor += 16
+        if not flags & 2:  # SAME_UUID clear => a 16-byte UUID field follows.
+            cursor += 16
+        if flags & 8:  # LAST_TAG
+            return last_flags
+    raise RuntimeError("generated JBD2 descriptor has no bounded LAST_TAG")
+
+
 def run_differential_case(binary, image, case_id, corruption_class, fixture_hash,
                           mutation, source_commit, binary_hash):
     nex_command = [str(binary), "--json", "-n", str(image)]
@@ -201,6 +319,25 @@ def run_differential_case(binary, image, case_id, corruption_class, fixture_hash
         "exit_code_agreement": nex.returncode == e2.returncode,
         "expected_result": "Nexfsck detects corruption; e2fsck behavior is recorded independently",
     }
+
+
+def jbd2_mutation_observed(counters, baseline):
+    if not isinstance(counters, dict) or not isinstance(baseline, dict):
+        return False
+    return (
+        counters.get("journal_integrity_failures", 0)
+        > baseline.get("journal_integrity_failures", 0)
+        or counters.get("journal_integrity_state") != baseline.get("journal_integrity_state")
+    )
+
+
+def jbd2_e2fsck_mutation_observed(text):
+    return bool(re.search(
+        r"journal.*(checksum|corrupt|invalid|bad)|(?:checksum|corrupt|invalid).*journal|"
+        r"bad journal|invalid transaction|journal block.*error",
+        text,
+        re.IGNORECASE,
+    ))
 
 
 def flip(path, offset):
@@ -599,6 +736,183 @@ def main():
             records.append(record)
 
         unavailable_cases = []
+        active_base = work / "active-journal-base.ext4"
+        try:
+            active_fixture, active_failure = make_active_journal_fixture(active_base, work)
+        except Exception as error:
+            active_fixture, active_failure = None, f"active journal fixture failed: {error}"
+        if active_fixture is None:
+            for case_id in (
+                "jbd2_superblock_checksum", "jbd2_descriptor_type", "jbd2_tag_bounds",
+                "jbd2_descriptor_checksum", "jbd2_invalid_target", "jbd2_wrong_descriptor_sequence",
+                "jbd2_commit_checksum", "jbd2_commit_wrong_sequence", "jbd2_missing_commit",
+                "jbd2_revoke_checksum", "jbd2_revoke_length",
+            ):
+                unavailable_cases.append({"case_id": case_id, "reason": active_failure})
+        else:
+            active_image, journal, active_fixture_hash, clean_fixture_hash = active_fixture
+            if not journal.get("descriptor_logicals") or not journal.get("commit_logicals"):
+                for case_id in (
+                    "jbd2_superblock_checksum", "jbd2_descriptor_type", "jbd2_tag_bounds",
+                    "jbd2_descriptor_checksum", "jbd2_invalid_target", "jbd2_wrong_descriptor_sequence",
+                    "jbd2_commit_checksum", "jbd2_commit_wrong_sequence", "jbd2_missing_commit",
+                    "jbd2_revoke_checksum", "jbd2_revoke_length",
+                ):
+                    unavailable_cases.append({
+                        "case_id": case_id,
+                        "reason": "active fixture had no discoverable descriptor/commit sequence",
+                    })
+            else:
+                baseline_nex = run([str(binary), "--json", "-n", str(active_image)])
+                baseline_counters = parse_structured_json(baseline_nex.stdout) or {}
+                baseline_e2 = run(["e2fsck", "-f", "-n", str(active_image)])
+                active_features = parse_dumpe2fs(active_image)[0]
+                descriptor_logical = journal["descriptor_logicals"][0]
+                commit_logical = journal["commit_logicals"][0]
+                descriptor_physical = journal_physical_block(active_image, journal, descriptor_logical)
+                commit_physical = journal_physical_block(active_image, journal, commit_logical)
+                last_tag_flags_offset = last_jbd_v3_tag_flags_offset(
+                    active_image, descriptor_physical, journal["block_size"]
+                )
+                jbd_cases = [
+                    ("jbd2_superblock_checksum", "jbd2_superblock_checksum",
+                     journal["superblock_physical"] * journal["block_size"] + 0xFC, "flip checksum byte",
+                     journal["superblock_physical"], None),
+                    ("jbd2_descriptor_type", "jbd2_structure",
+                     descriptor_physical * block_size + 4, "write invalid block type",
+                     descriptor_physical, None),
+                    ("jbd2_tag_bounds", "jbd2_descriptor_tag",
+                     descriptor_physical * block_size + last_tag_flags_offset,
+                     "clear LAST_TAG on final descriptor tag; refresh descriptor CRC",
+                     descriptor_physical, "clear_last_tag"),
+                    ("jbd2_descriptor_checksum", "jbd2_descriptor_checksum",
+                     descriptor_physical * block_size + block_size - 1, "flip descriptor checksum byte",
+                     descriptor_physical, None),
+                    ("jbd2_invalid_target", "jbd2_descriptor_target",
+                     descriptor_physical * block_size + 12, "write invalid target; refresh descriptor CRC",
+                     descriptor_physical, "target_crc"),
+                    ("jbd2_wrong_descriptor_sequence", "jbd2_sequence",
+                     descriptor_physical * block_size + 8, "increment sequence; refresh descriptor CRC",
+                     descriptor_physical, "descriptor_crc_sequence"),
+                    ("jbd2_commit_checksum", "jbd2_commit_checksum",
+                     commit_physical * block_size + 16, "flip commit checksum byte",
+                     commit_physical, None),
+                    ("jbd2_commit_wrong_sequence", "jbd2_sequence",
+                     commit_physical * block_size + 8, "increment sequence; refresh commit CRC",
+                     commit_physical, "commit_crc_sequence"),
+                    ("jbd2_missing_commit", "jbd2_incomplete_transaction",
+                     commit_physical * block_size, "clear commit block magic",
+                     commit_physical, None),
+                ]
+                for case_id, corruption_class, offset, operation, physical, checksum_mode in jbd_cases:
+                    image = work / f"{case_id}.ext4"
+                    shutil.copyfile(active_image, image)
+                    with image.open("r+b") as stream:
+                        stream.seek(offset)
+                        if checksum_mode in ("descriptor_crc", "target_crc"):
+                            stream.write((0xFFFFFFFF).to_bytes(4, "big"))
+                        elif checksum_mode == "clear_last_tag":
+                            stream.seek(offset)
+                            flags = int.from_bytes(stream.read(4), "big")
+                            stream.seek(offset)
+                            stream.write((flags & ~8).to_bytes(4, "big"))
+                        elif checksum_mode == "descriptor_crc_sequence":
+                            stream.seek(offset)
+                            sequence = int.from_bytes(stream.read(4), "big")
+                            stream.seek(offset)
+                            stream.write(((sequence + 1) & 0xFFFFFFFF).to_bytes(4, "big"))
+                        elif checksum_mode == "commit_crc_sequence":
+                            sequence = int.from_bytes(stream.read(4), "big")
+                            stream.seek(offset)
+                            stream.write(((sequence + 1) & 0xFFFFFFFF).to_bytes(4, "big"))
+                        elif case_id == "jbd2_descriptor_type":
+                            stream.write((99).to_bytes(4, "big"))
+                        elif case_id == "jbd2_missing_commit":
+                            stream.write(bytes(4))
+                        else:
+                            original = stream.read(1)
+                            stream.seek(offset)
+                            stream.write(bytes([original[0] ^ 1]))
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    if checksum_mode in (
+                        "descriptor_crc", "target_crc", "descriptor_crc_sequence", "clear_last_tag"
+                    ):
+                        refresh_jbd_block_checksum(
+                            image, physical, block_size, journal["uuid"], block_size - 4
+                        )
+                    elif checksum_mode == "commit_crc_sequence":
+                        refresh_jbd_block_checksum(image, physical, block_size,
+                                                   journal["uuid"], 16)
+                    record = run_differential_case(
+                        binary, image, case_id, corruption_class, clean_fixture_hash,
+                        {"byte_offset": offset, "journal_log_block":
+                            0 if case_id == "jbd2_superblock_checksum"
+                            else descriptor_logical if physical == descriptor_physical else commit_logical,
+                         "journal_physical_block": physical, "transaction_sequence":
+                            int.from_bytes(journal["journal_superblock"][24:28], "big"),
+                         "operation": operation},
+                        source_commit, binary_hash,
+                    )
+                    record["feature_set"] = active_features.get("Filesystem features", "unknown")
+                    record["active_source_fixture_sha256"] = active_fixture_hash
+                    record["journal_integrity_state"] = (
+                        record["nexfsck"]["structured_counters"] or {}
+                    ).get("journal_integrity_state")
+                    record["journal_fixture"] = {
+                        "kind": "mounted_ext4_active_journal_snapshot",
+                        "journal_inode": journal["journal_inode"],
+                        "start": journal["start"],
+                        "descriptor_logicals": journal["descriptor_logicals"],
+                        "commit_logicals": journal["commit_logicals"],
+                    }
+                    counters = record["nexfsck"]["structured_counters"] or {}
+                    nex_mutation = jbd2_mutation_observed(counters, baseline_counters)
+                    e2_mutation = jbd2_e2fsck_mutation_observed(
+                        record["e2fsck"]["diagnostic"]
+                    ) and not jbd2_e2fsck_mutation_observed(
+                        baseline_e2.stderr + baseline_e2.stdout
+                    )
+                    record["baseline"] = {
+                        "nexfsck_exit_code": baseline_nex.returncode,
+                        "journal_integrity_state": baseline_counters.get("journal_integrity_state"),
+                        "e2fsck_exit_code": baseline_e2.returncode,
+                        "e2fsck_journal_diagnostic": jbd2_e2fsck_mutation_observed(
+                            baseline_e2.stderr + baseline_e2.stdout
+                        ),
+                    }
+                    record["nexfsck"]["mutation_detected_vs_active_baseline"] = nex_mutation
+                    record["e2fsck"]["mutation_detected_vs_active_baseline"] = e2_mutation
+                    record["agreement"] = nex_mutation == e2_mutation
+                    if nex_mutation and e2_mutation:
+                        record["agreement_class"] = "both_detect"
+                    elif nex_mutation:
+                        record["agreement_class"] = "nexfsck_only_detects"
+                    elif e2_mutation:
+                        record["agreement_class"] = "e2fsck_only_detects"
+                    else:
+                        record["agreement_class"] = "both_accept"
+                    record["differential_classification"] = record["agreement_class"]
+                    record["disagreement_class"] = (
+                        None if record["agreement"] else "behavior_difference"
+                    )
+                    records.append(record)
+
+                if journal.get("revoke_logicals"):
+                    unavailable_cases.extend([
+                        {"case_id": "jbd2_revoke_checksum",
+                         "reason": "revoke mutation not yet isolated in the generated transaction"},
+                        {"case_id": "jbd2_revoke_length",
+                         "reason": "revoke mutation not yet isolated in the generated transaction"},
+                    ])
+                else:
+                    unavailable_cases.extend([
+                        {"case_id": "jbd2_revoke_checksum",
+                         "reason": "kernel-generated transaction contained no revoke block"},
+                        {"case_id": "jbd2_revoke_length",
+                         "reason": "kernel-generated transaction contained no revoke block"},
+                    ])
+
         shared_image = work / "shared-xattr.ext4"
         try:
             shared_block, shared_failure = make_shared_xattr_fixture(shared_image, work)
@@ -653,6 +967,15 @@ def main():
                 "total": len(records),
                 "agreement": sum(case["agreement"] for case in records),
                 "disagreement": sum(not case["agreement"] for case in records),
+                "agreement_classes": {
+                    name: sum(case["agreement_class"] == name for case in records)
+                    for name in (
+                        "both_detect", "nexfsck_only_detects", "e2fsck_only_detects",
+                        "both_accept", "scope_difference", "behavior_difference",
+                        "manual_review_required",
+                    )
+                },
+                "unavailable": len(unavailable_cases),
             },
         }
         if args.check_manifest:
@@ -675,6 +998,16 @@ def main():
                     regressions.append(f"{case_id}: required counter {required_counter} disappeared")
                 if case_id in manifest.get("must_block_repair", []) and counters.get("repair_eligible") is not False:
                     regressions.append(f"{case_id}: RepairTrustState no longer blocks repair")
+                if case_id.startswith("jbd2_") and not case["nexfsck"].get(
+                    "mutation_detected_vs_active_baseline", False
+                ):
+                    regressions.append(f"{case_id}: no JBD2 integrity-state delta from active baseline")
+                required_journal_state = manifest.get("required_journal_states", {}).get(case_id)
+                if required_journal_state and counters.get("journal_integrity_state") != required_journal_state:
+                    regressions.append(
+                        f"{case_id}: expected journal state {required_journal_state}, "
+                        f"got {counters.get('journal_integrity_state')}"
+                    )
                 if case_id in manifest.get("repair_must_preserve_image", []):
                     repair_attempt = case.get("repair_attempt", {})
                     if not repair_attempt.get("image_unchanged"):

@@ -180,7 +180,6 @@ fn unsupported_ext4_feature(sb: &nexfsck_core::Ext4Superblock) -> Option<&'stati
         return Some("unknown incompat feature bits");
     }
     for (bit, name) in [
-        (EXT4_FEATURE_INCOMPAT_RECOVER, "needs_journal_recovery"),
         (EXT4_FEATURE_INCOMPAT_JOURNAL_DEV, "external_journal_device"),
         (
             EXT4_FEATURE_INCOMPAT_MMP,
@@ -640,8 +639,21 @@ fn main() -> ExitCode {
     // JBD2 Crash Recovery Journal Inspection
     let mut journal_is_dirty = false;
     let mut journal_integrity_failures = 0u64;
+    let mut journal_transaction_blocks_checked = 0u64;
+    let mut journal_committed_transactions = 0u64;
+    let mut journal_integrity_state = "absent";
     match nexfsck_journal::inspect_journal(&dev, &sb, &group_descriptors, is_64bit) {
-        Ok(Some(jbd)) => {
+        Ok(Some(inspection)) => {
+            journal_transaction_blocks_checked = inspection.transaction_blocks_checked;
+            journal_committed_transactions = inspection.committed_transactions;
+            journal_integrity_state = match inspection.state {
+                nexfsck_journal::JournalTransactionState::Clean => "clean",
+                nexfsck_journal::JournalTransactionState::CommittedTransactions => {
+                    "committed_transactions"
+                }
+                nexfsck_journal::JournalTransactionState::IncompleteTail => "incomplete_tail",
+            };
+            let jbd = inspection.superblock;
             let is_dirty = !jbd.is_clean()
                 || sb.has_incompat_feature(nexfsck_core::EXT4_FEATURE_INCOMPAT_RECOVER);
             journal_is_dirty = is_dirty;
@@ -652,6 +664,12 @@ fn main() -> ExitCode {
                     jbd.block_size(),
                     !is_dirty
                 );
+                info!(
+                    "JBD2 transaction inspection: {:?}, {} blocks checked, {} committed transaction(s)",
+                    inspection.state,
+                    inspection.transaction_blocks_checked,
+                    inspection.committed_transactions
+                );
             }
             if is_dirty {
                 warn!("Filesystem journal is DIRTY: uncommitted or pending transactions exist.");
@@ -661,6 +679,7 @@ fn main() -> ExitCode {
         Err(error) => {
             journal_is_dirty = true;
             journal_integrity_failures = 1;
+            journal_integrity_state = "corrupt_or_unsupported";
             error!("JBD2 journal integrity could not be established: {}", error);
         }
     }
@@ -1657,6 +1676,18 @@ fn main() -> ExitCode {
             total_inode_discrepancy.leaked_inodes
         );
         println!("  \"journal_dirty\": {},", journal_is_dirty);
+        println!(
+            "  \"journal_transaction_blocks_checked\": {},",
+            journal_transaction_blocks_checked
+        );
+        println!(
+            "  \"journal_committed_transactions\": {},",
+            journal_committed_transactions
+        );
+        println!(
+            "  \"journal_integrity_state\": \"{}\",",
+            journal_integrity_state
+        );
         println!(
             "  \"journal_integrity_failures\": {},",
             journal_integrity_failures

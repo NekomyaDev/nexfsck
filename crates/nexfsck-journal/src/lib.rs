@@ -118,6 +118,23 @@ pub struct JournalReplayPlan {
     pub writes: Vec<JournalReplayWrite>,
 }
 
+/// Result of inspecting the real filesystem journal inode. Transaction blocks
+/// are validated read-only; this type never implies that replay is supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalTransactionState {
+    Clean,
+    CommittedTransactions,
+    IncompleteTail,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct JournalInspection {
+    pub superblock: Jbd2Superblock,
+    pub state: JournalTransactionState,
+    pub transaction_blocks_checked: u64,
+    pub committed_transactions: u64,
+}
+
 /// Descriptor/revoke encoding selected from the JBD2 superblock. Unknown
 /// incompatibility bits must be rejected by the caller rather than guessed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -408,9 +425,9 @@ fn parse_descriptor_tags(
             ));
         }
         let mut target = u32::from_be_bytes(block[offset..offset + 4].try_into().unwrap()) as u64;
-        let flags = u32::from_be_bytes(block[offset + 4..offset + 8].try_into().unwrap());
-        offset += 8;
-        let checksum = if features.checksum_v3 {
+        let (flags, checksum) = if features.checksum_v3 {
+            let flags = u32::from_be_bytes(block[offset + 4..offset + 8].try_into().unwrap());
+            offset += 8;
             if offset + 8 > limit {
                 return Err(JournalError::CorruptLog("truncated JBD2 v3 tag".into()));
             }
@@ -425,8 +442,12 @@ fn parse_descriptor_tags(
             }
             let checksum = u32::from_be_bytes(block[offset + 4..offset + 8].try_into().unwrap());
             offset += 8;
-            Some(checksum)
+            (flags, Some(checksum))
         } else {
+            let _checksum = u16::from_be_bytes(block[offset + 4..offset + 6].try_into().unwrap());
+            let flags =
+                u16::from_be_bytes(block[offset + 6..offset + 8].try_into().unwrap()) as u32;
+            offset += 8;
             if features.block_64bit {
                 if offset + 4 > block.len() {
                     return Err(JournalError::CorruptLog("truncated JBD2 64-bit tag".into()));
@@ -436,7 +457,7 @@ fn parse_descriptor_tags(
                     << 32;
                 offset += 4;
             }
-            None
+            (flags, None)
         };
         const KNOWN_FLAGS: u32 =
             JBD2_FLAG_ESCAPE | JBD2_FLAG_SAME_UUID | JBD2_FLAG_DELETED | JBD2_FLAG_LAST_TAG;
@@ -451,11 +472,6 @@ fn parse_descriptor_tags(
             if offset + 16 > limit {
                 return Err(JournalError::CorruptLog("truncated JBD2 tag UUID".into()));
             }
-            if features.checksum_v3 && block[offset..offset + 16] != features.uuid {
-                return Err(JournalError::CorruptLog(
-                    "JBD2 tag UUID does not match journal UUID".into(),
-                ));
-            }
             offset += 16;
         }
         if flags & JBD2_FLAG_LAST_TAG != 0 {
@@ -463,6 +479,138 @@ fn parse_descriptor_tags(
         }
     }
     Ok(tags)
+}
+
+fn validate_transaction_stream(
+    blocks: &[Vec<u8>],
+    first_sequence: u32,
+    filesystem_blocks: u64,
+    features: JournalFeatures,
+) -> Result<(u64, JournalTransactionState, u64), JournalError> {
+    let mut cursor = 0usize;
+    let mut expected_sequence = first_sequence;
+    let mut committed = 0u64;
+    let mut incomplete = false;
+
+    while cursor < blocks.len() {
+        let first_header = match parse_journal_header(&blocks[cursor]) {
+            Ok(header) => header,
+            Err(_) if committed != 0 => break,
+            Err(error) => return Err(error),
+        };
+        if first_header.sequence() != expected_sequence {
+            if committed == 0 {
+                incomplete = true;
+            }
+            break;
+        }
+
+        let sequence = expected_sequence;
+        let mut saw_descriptor = false;
+        let mut saw_revoke = false;
+        let mut transaction_complete = false;
+        let mut revoked = std::collections::HashSet::new();
+
+        while cursor < blocks.len() {
+            let header = match parse_journal_header(&blocks[cursor]) {
+                Ok(header) => header,
+                Err(_) => {
+                    incomplete = true;
+                    break;
+                }
+            };
+            if header.sequence() != sequence {
+                // The active log ended before this transaction committed.
+                incomplete = true;
+                break;
+            }
+            match header.block_type() {
+                JBD2_DESCRIPTOR_BLOCK => {
+                    saw_descriptor = true;
+                    if features.checksum_v3 {
+                        validate_jbd2_v3_block_checksum(&blocks[cursor], features.uuid, false)?;
+                    }
+                    let tags = parse_descriptor_tags(&blocks[cursor], features)?;
+                    cursor += 1;
+                    for (target, flags, expected_checksum) in tags {
+                        if target >= filesystem_blocks {
+                            return Err(JournalError::CorruptLog(format!(
+                                "JBD2 target block {target} is out of bounds"
+                            )));
+                        }
+                        if flags & JBD2_FLAG_DELETED != 0 {
+                            continue;
+                        }
+                        let data = blocks.get(cursor).ok_or_else(|| {
+                            JournalError::CorruptLog(
+                                "JBD2 descriptor references data beyond the active log".into(),
+                            )
+                        })?;
+                        if let Some(expected) = expected_checksum {
+                            let actual = jbd2_tag_checksum(features.uuid, sequence, data);
+                            if actual != expected {
+                                return Err(JournalError::CorruptLog(format!(
+                                    "JBD2 checksum-v3 mismatch for target block {target}"
+                                )));
+                            }
+                        }
+                        cursor += 1;
+                    }
+                }
+                JBD2_REVOKE_BLOCK => {
+                    saw_revoke = true;
+                    if features.checksum_v3 {
+                        validate_jbd2_v3_block_checksum(&blocks[cursor], features.uuid, false)?;
+                    }
+                    parse_revoke_block(
+                        &blocks[cursor],
+                        &mut revoked,
+                        features.block_64bit,
+                        filesystem_blocks,
+                        features.checksum_v3,
+                    )?;
+                    cursor += 1;
+                }
+                JBD2_COMMIT_BLOCK => {
+                    if !saw_descriptor && !saw_revoke {
+                        return Err(JournalError::CorruptLog(
+                            "JBD2 commit has no preceding descriptor or revoke block".into(),
+                        ));
+                    }
+                    if features.checksum_v3 {
+                        validate_jbd2_v3_block_checksum(&blocks[cursor], features.uuid, true)?;
+                    }
+                    cursor += 1;
+                    transaction_complete = true;
+                    break;
+                }
+                other => {
+                    if saw_descriptor || saw_revoke {
+                        incomplete = true;
+                    }
+                    // A non-transaction block terminates the active log, as
+                    // in JBD2 recovery scan. It is not treated as a clean log.
+                    let _ = other;
+                    cursor = blocks.len();
+                    break;
+                }
+            }
+        }
+
+        if !transaction_complete {
+            incomplete = true;
+            break;
+        }
+        committed += 1;
+        expected_sequence = expected_sequence.wrapping_add(1);
+    }
+
+    let state = if incomplete || committed == 0 {
+        JournalTransactionState::IncompleteTail
+    } else {
+        JournalTransactionState::CommittedTransactions
+    };
+    Ok((committed, state, cursor as u64))
 }
 
 fn parse_revoke_block(
@@ -511,9 +659,9 @@ fn validate_jbd2_v3_block_checksum(
 ) -> Result<(), JournalError> {
     let mut bytes = block.to_vec();
     let checksum_offset = if is_commit {
-        if block.len() < 20 || block[12] != 4 || block[13] != 4 {
+        if block.len() < 20 || block[12..16] != [0; 4] {
             return Err(JournalError::CorruptLog(
-                "unsupported JBD2 commit checksum type or size".into(),
+                "truncated or unsupported JBD2 v2/v3 commit header".into(),
             ));
         }
         16
@@ -767,7 +915,7 @@ pub fn inspect_journal(
     sb: &Ext4Superblock,
     descriptors: &[Ext4GroupDesc],
     is_64bit: bool,
-) -> Result<Option<Jbd2Superblock>, JournalError> {
+) -> Result<Option<JournalInspection>, JournalError> {
     let journal_inum = u32::from_le(sb.s_journal_inum);
     if journal_inum == 0 {
         return Ok(None);
@@ -822,32 +970,108 @@ pub fn inspect_journal(
         || header.depth() != 0
         || header.entries() == 0
         || header.entries() > header.max()
+        || header.max() > 4
     {
         return Err(JournalError::CorruptLog(
             "journal extent root is malformed or requires unsupported traversal".into(),
         ));
     }
-    let ext = Ext4Extent::ref_from_prefix(&root[12..])
-        .map_err(|_| JournalError::CorruptLog("truncated first journal extent".into()))?
-        .0;
-    if ext.logical_block() != 0 || ext.block_count() == 0 || ext.is_unwritten() {
-        return Err(JournalError::CorruptLog(
-            "first journal extent does not map logical block zero".into(),
-        ));
+    let mut journal_map = Vec::new();
+    let entries = header.entries() as usize;
+    for entry in 0..entries {
+        let start = 12 + entry * 12;
+        let ext = Ext4Extent::ref_from_prefix(&root[start..])
+            .map_err(|_| JournalError::CorruptLog("truncated journal extent".into()))?
+            .0;
+        if ext.block_count() == 0 || ext.is_unwritten() {
+            return Err(JournalError::CorruptLog(
+                "journal extent has a zero or unwritten range".into(),
+            ));
+        }
+        if entry == 0 && ext.logical_block() != 0 {
+            return Err(JournalError::CorruptLog(
+                "journal extent map does not begin at logical block zero".into(),
+            ));
+        }
+        let logical_end = ext
+            .logical_block()
+            .checked_add(ext.block_count())
+            .ok_or_else(|| JournalError::CorruptLog("journal logical extent overflow".into()))?;
+        if logical_end as usize != journal_map.len() + ext.block_count() as usize {
+            return Err(JournalError::CorruptLog(
+                "journal extents are unordered or contain a logical gap".into(),
+            ));
+        }
+        let physical_start = ext.physical_start();
+        let physical_end = physical_start
+            .checked_add(ext.block_count() as u64)
+            .ok_or_else(|| JournalError::CorruptLog("journal physical extent overflow".into()))?;
+        if physical_end > sb.total_blocks() {
+            return Err(JournalError::CorruptLog(
+                "journal extent points outside the filesystem".into(),
+            ));
+        }
+        journal_map.extend(physical_start..physical_end);
     }
-    let first_block = ext.physical_start();
-    let extent_end = first_block.checked_add(ext.block_count() as u64);
-    if extent_end.is_none_or(|end| end > sb.total_blocks()) {
-        return Err(JournalError::CorruptLog(
-            "journal superblock extent points outside the filesystem".into(),
-        ));
-    }
-    let block_bytes = dev.read_block(first_block, sb.block_size())?;
+    let block_bytes = dev.read_block(journal_map[0], sb.block_size())?;
     let (jbd_sb, _) = Jbd2Superblock::ref_from_prefix(&block_bytes)
         .map_err(|_| JournalError::CorruptLog("truncated JBD2 superblock".into()))?;
     jbd_sb.verify_magic()?;
-    validate_journal_superblock_integrity(&block_bytes, sb.block_size())?;
-    Ok(Some(*jbd_sb))
+    let features = validate_journal_superblock_integrity(&block_bytes, sb.block_size())?;
+    let maxlen = u32::from_be(jbd_sb.s_maxlen) as usize;
+    let first = u32::from_be(jbd_sb.s_first) as usize;
+    let start = u32::from_be(jbd_sb.s_start) as usize;
+    if maxlen > journal_map.len() {
+        return Err(JournalError::CorruptLog(format!(
+            "journal inode maps {} blocks but superblock declares {maxlen}",
+            journal_map.len()
+        )));
+    }
+    if start == 0 {
+        return Ok(Some(JournalInspection {
+            superblock: *jbd_sb,
+            state: JournalTransactionState::Clean,
+            transaction_blocks_checked: 0,
+            committed_transactions: 0,
+        }));
+    }
+
+    // Hard memory bound: the parser currently accepts an in-memory block
+    // stream. A larger active ring is rejected, never partially scanned.
+    const MAX_ACTIVE_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
+    // Read at most one complete ring, beginning at s_start. A larger count
+    // would revisit s_start and could make a malformed log look cyclic.
+    let active_blocks = maxlen - first;
+    let block_size = sb.block_size() as usize;
+    if active_blocks
+        .checked_mul(block_size)
+        .is_none_or(|bytes| bytes > MAX_ACTIVE_JOURNAL_BYTES)
+    {
+        return Err(JournalError::CorruptLog(
+            "active journal range exceeds the bounded verifier limit".into(),
+        ));
+    }
+    let mut blocks = Vec::with_capacity(active_blocks);
+    let mut logical = start;
+    for _ in 0..active_blocks {
+        if logical >= maxlen {
+            logical = first;
+        }
+        let physical = *journal_map
+            .get(logical)
+            .ok_or_else(|| JournalError::CorruptLog("active journal block is not mapped".into()))?;
+        blocks.push(dev.read_block(physical, sb.block_size())?);
+        logical += 1;
+    }
+    let sequence = u32::from_be(jbd_sb.s_sequence);
+    let (committed_transactions, state, transaction_blocks_checked) =
+        validate_transaction_stream(&blocks, sequence, sb.total_blocks(), features)?;
+    Ok(Some(JournalInspection {
+        superblock: *jbd_sb,
+        state,
+        transaction_blocks_checked,
+        committed_transactions,
+    }))
 }
 
 #[cfg(test)]
@@ -867,8 +1091,7 @@ mod tests {
         let offset = if is_commit { 16 } else { block.len() - 4 };
         block[offset..offset + 4].fill(0);
         if is_commit {
-            block[12] = 4;
-            block[13] = 4;
+            block[12..16].fill(0);
         }
         let seed = crc32c_kernel(!0, &uuid);
         let checksum = crc32c_kernel(seed, block);
@@ -921,8 +1144,8 @@ mod tests {
     fn plans_only_committed_jbd2_data() {
         let mut descriptor = header(JBD2_DESCRIPTOR_BLOCK, 7, 64);
         descriptor[12..16].copy_from_slice(&42u32.to_be_bytes());
-        descriptor[16..20]
-            .copy_from_slice(&(JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG).to_be_bytes());
+        descriptor[18..20]
+            .copy_from_slice(&((JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG) as u16).to_be_bytes());
         let data = vec![0x5a; 64];
         let commit = header(JBD2_COMMIT_BLOCK, 7, 64);
         let plan = build_replay_plan(&[descriptor, data.clone(), commit], 7, 100).unwrap();
@@ -938,11 +1161,83 @@ mod tests {
     }
 
     #[test]
+    fn validates_real_transaction_stream_and_reports_incomplete_tail() {
+        let mut descriptor = header(JBD2_DESCRIPTOR_BLOCK, 7, 64);
+        descriptor[12..16].copy_from_slice(&42u32.to_be_bytes());
+        descriptor[18..20]
+            .copy_from_slice(&((JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG) as u16).to_be_bytes());
+        let data = vec![0x5a; 64];
+        let commit = header(JBD2_COMMIT_BLOCK, 7, 64);
+        let features = JournalFeatures::default();
+        let (committed, state, checked) = validate_transaction_stream(
+            &[descriptor.clone(), data.clone(), commit],
+            7,
+            100,
+            features,
+        )
+        .unwrap();
+        assert_eq!(committed, 1);
+        assert_eq!(state, JournalTransactionState::CommittedTransactions);
+        assert_eq!(checked, 3);
+
+        let (committed, state, checked) =
+            validate_transaction_stream(&[descriptor, data], 7, 100, features).unwrap();
+        assert_eq!(committed, 0);
+        assert_eq!(state, JournalTransactionState::IncompleteTail);
+        assert_eq!(checked, 2);
+    }
+
+    #[test]
+    fn rejects_real_transaction_target_outside_filesystem() {
+        let mut descriptor = header(JBD2_DESCRIPTOR_BLOCK, 7, 64);
+        descriptor[12..16].copy_from_slice(&100u32.to_be_bytes());
+        descriptor[18..20]
+            .copy_from_slice(&((JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG) as u16).to_be_bytes());
+        let data = vec![0; 64];
+        let commit = header(JBD2_COMMIT_BLOCK, 7, 64);
+        assert!(validate_transaction_stream(
+            &[descriptor, data, commit],
+            7,
+            100,
+            JournalFeatures::default()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validates_multiple_descriptors_and_revoke_only_transaction_metadata() {
+        let mut descriptor_a = header(JBD2_DESCRIPTOR_BLOCK, 12, 64);
+        descriptor_a[12..16].copy_from_slice(&9u32.to_be_bytes());
+        descriptor_a[18..20]
+            .copy_from_slice(&((JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG) as u16).to_be_bytes());
+        let data_a = vec![0x11; 64];
+        let mut descriptor_b = header(JBD2_DESCRIPTOR_BLOCK, 12, 64);
+        descriptor_b[12..16].copy_from_slice(&10u32.to_be_bytes());
+        descriptor_b[18..20]
+            .copy_from_slice(&((JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG) as u16).to_be_bytes());
+        let data_b = vec![0x22; 64];
+        let mut revoke = header(JBD2_REVOKE_BLOCK, 12, 64);
+        revoke[12..16].copy_from_slice(&16u32.to_be_bytes());
+        let commit = header(JBD2_COMMIT_BLOCK, 12, 64);
+
+        let (committed, state, checked) = validate_transaction_stream(
+            &[descriptor_a, data_a, descriptor_b, data_b, revoke, commit],
+            12,
+            100,
+            JournalFeatures::default(),
+        )
+        .unwrap();
+        assert_eq!(committed, 1);
+        assert_eq!(state, JournalTransactionState::CommittedTransactions);
+        assert_eq!(checked, 6);
+    }
+
+    #[test]
     fn ignores_uncommitted_tail() {
         let mut descriptor = header(JBD2_DESCRIPTOR_BLOCK, 3, 64);
         descriptor[12..16].copy_from_slice(&9u32.to_be_bytes());
-        descriptor[16..20]
-            .copy_from_slice(&(JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG).to_be_bytes());
+        descriptor[18..20]
+            .copy_from_slice(&((JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG) as u16).to_be_bytes());
         let plan = build_replay_plan(&[descriptor, vec![1; 64]], 3, 100).unwrap();
         assert!(plan.writes.is_empty());
     }
@@ -951,8 +1246,8 @@ mod tests {
     fn revoke_removes_committed_write() {
         let mut descriptor = header(JBD2_DESCRIPTOR_BLOCK, 4, 64);
         descriptor[12..16].copy_from_slice(&11u32.to_be_bytes());
-        descriptor[16..20]
-            .copy_from_slice(&(JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG).to_be_bytes());
+        descriptor[18..20]
+            .copy_from_slice(&((JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG) as u16).to_be_bytes());
         let mut revoke = header(JBD2_REVOKE_BLOCK, 4, 64);
         revoke[12..16].copy_from_slice(&20u32.to_be_bytes());
         revoke[16..20].copy_from_slice(&11u32.to_be_bytes());
@@ -982,6 +1277,12 @@ mod tests {
         seal_v3_metadata(&mut descriptor, features.uuid, false);
         let mut commit = header(JBD2_COMMIT_BLOCK, sequence, 64);
         seal_v3_metadata(&mut commit, features.uuid, true);
+        let mut unsupported_commit_header = commit.clone();
+        unsupported_commit_header[12] = 4;
+        assert!(
+            validate_jbd2_v3_block_checksum(&unsupported_commit_header, features.uuid, true)
+                .is_err()
+        );
         let plan = build_replay_plan_with_features(
             &[descriptor.clone(), data.clone(), commit.clone()],
             sequence,
