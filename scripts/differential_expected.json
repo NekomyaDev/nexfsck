@@ -103,11 +103,11 @@
     "extent_overlap_xattr_block"
   ],
   "required_journal_states": {
-    "jbd2_descriptor_type": "incomplete_tail",
+    "jbd2_descriptor_type": "corrupt_or_unsupported",
     "jbd2_tag_bounds": "corrupt_or_unsupported",
-    "jbd2_wrong_descriptor_sequence": "incomplete_tail",
-    "jbd2_commit_wrong_sequence": "incomplete_tail",
-    "jbd2_missing_commit": "incomplete_tail"
+    "jbd2_wrong_descriptor_sequence": "corrupt_or_unsupported",
+    "jbd2_commit_wrong_sequence": "corrupt_or_unsupported",
+    "jbd2_missing_commit": "corrupt_or_unsupported"
   },
   "known_e2fsck_disagreements": {
     "backup_superblock_checksum": "e2fsck 1.46.5 ordinary -fn does not validate this backup copy"
