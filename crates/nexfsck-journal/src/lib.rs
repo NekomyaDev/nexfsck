@@ -500,7 +500,10 @@ fn validate_transaction_stream(
         };
         if first_header.sequence() != expected_sequence {
             if committed == 0 {
-                incomplete = true;
+                return Err(JournalError::CorruptLog(format!(
+                    "active JBD2 log starts at sequence {}, expected {expected_sequence}",
+                    first_header.sequence()
+                )));
             }
             break;
         }
@@ -515,12 +518,24 @@ fn validate_transaction_stream(
             let header = match parse_journal_header(&blocks[cursor]) {
                 Ok(header) => header,
                 Err(_) => {
+                    if saw_descriptor || saw_revoke {
+                        return Err(JournalError::CorruptLog(
+                            "malformed JBD2 block inside an uncommitted transaction".into(),
+                        ));
+                    }
                     incomplete = true;
                     break;
                 }
             };
             if header.sequence() != sequence {
-                // The active log ended before this transaction committed.
+                if saw_descriptor || saw_revoke {
+                    return Err(JournalError::CorruptLog(format!(
+                        "JBD2 transaction sequence changed from {sequence} to {} before commit",
+                        header.sequence()
+                    )));
+                }
+                // A different sequence after a fully committed transaction
+                // marks the stale end of the active ring.
                 incomplete = true;
                 break;
             }
@@ -586,11 +601,17 @@ fn validate_transaction_stream(
                 }
                 other => {
                     if saw_descriptor || saw_revoke {
-                        incomplete = true;
+                        return Err(JournalError::CorruptLog(format!(
+                            "unexpected JBD2 block type {other} inside transaction {sequence}"
+                        )));
                     }
-                    // A non-transaction block terminates the active log, as
-                    // in JBD2 recovery scan. It is not treated as a clean log.
-                    let _ = other;
+                    if committed == 0 {
+                        return Err(JournalError::CorruptLog(format!(
+                            "unexpected JBD2 block type {other} at active log start"
+                        )));
+                    }
+                    // Once at least one transaction has committed, a
+                    // non-transaction block terminates the active log.
                     cursor = blocks.len();
                     break;
                 }
@@ -1185,6 +1206,38 @@ mod tests {
         assert_eq!(committed, 0);
         assert_eq!(state, JournalTransactionState::IncompleteTail);
         assert_eq!(checked, 2);
+    }
+
+    #[test]
+    fn rejects_corrupt_active_journal_headers_and_sequences() {
+        let mut descriptor = header(JBD2_DESCRIPTOR_BLOCK, 7, 64);
+        descriptor[12..16].copy_from_slice(&42u32.to_be_bytes());
+        descriptor[18..20]
+            .copy_from_slice(&((JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG) as u16).to_be_bytes());
+        let data = vec![0x5a; 64];
+
+        let mut bad_type = header(99, 7, 64);
+        assert!(validate_transaction_stream(
+            &[bad_type.clone()],
+            7,
+            100,
+            JournalFeatures::default()
+        )
+        .is_err());
+        bad_type[4..8].copy_from_slice(&JBD2_DESCRIPTOR_BLOCK.to_be_bytes());
+        bad_type[8..12].copy_from_slice(&8u32.to_be_bytes());
+        assert!(
+            validate_transaction_stream(&[bad_type], 7, 100, JournalFeatures::default()).is_err()
+        );
+
+        let wrong_sequence_commit = header(JBD2_COMMIT_BLOCK, 8, 64);
+        assert!(validate_transaction_stream(
+            &[descriptor, data, wrong_sequence_commit],
+            7,
+            100,
+            JournalFeatures::default()
+        )
+        .is_err());
     }
 
     #[test]
