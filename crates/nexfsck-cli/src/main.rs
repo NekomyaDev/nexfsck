@@ -11,11 +11,11 @@ use tracing::{debug, error, info, warn};
 use zerocopy::IntoBytes;
 
 use nexfsck_compute::{
-    collect_directory_blocks, collect_inode_extents, reconcile_block_bitmap,
-    reconcile_inode_bitmap, verify_directory_block_compact, verify_htree_directory,
-    verify_inodes_parallel_with_metadata, BitmapDiscrepancy, BlockAllocationTracker,
-    Ext4MetadataChecksum, HardwareProfile, InodeBitmapDiscrepancy, InodeChecksumResult,
-    InodeChecksumVerifier, InodeVerificationStats, XattrBlockValidation,
+    collect_directory_blocks, collect_inode_extent_tree_blocks, collect_inode_extents,
+    reconcile_block_bitmap, reconcile_inode_bitmap, verify_directory_block_compact,
+    verify_htree_directory, verify_inodes_parallel_with_metadata, BitmapDiscrepancy,
+    BlockAllocationTracker, Ext4MetadataChecksum, HardwareProfile, InodeBitmapDiscrepancy,
+    InodeChecksumResult, InodeChecksumVerifier, InodeVerificationStats, XattrBlockValidation,
 };
 use nexfsck_gpu::{BlockInterval, GpuAccelerator};
 use nexfsck_io::{BlockDevice, IoBackend};
@@ -687,7 +687,11 @@ fn main() -> ExitCode {
     let blocks_per_group = sb.blocks_per_group();
     let desc_size = sb.desc_size() as u64;
     let gdt_blocks = (bg_count * desc_size).div_ceil(block_size);
-    let reserved_gdt = u16::from_le(sb.s_reserved_gdt_blocks) as u64;
+    let reserved_gdt = if sb.has_compat_feature(nexfsck_core::EXT4_FEATURE_COMPAT_RESIZE_INODE) {
+        u16::from_le(sb.s_reserved_gdt_blocks) as u64
+    } else {
+        0
+    };
     let inode_table_blocks =
         (sb.inodes_per_group() as u64 * sb.inode_size() as u64).div_ceil(block_size);
 
@@ -887,18 +891,6 @@ fn main() -> ExitCode {
                 }
                 inode_metadata_collection_time += operation_started.elapsed();
 
-                let operation_started = Instant::now();
-                verify_inodes_parallel_with_metadata(
-                    &inodes,
-                    first_inode,
-                    &tracker,
-                    Some(&protected_metadata_tracker),
-                    u32::from_le(sb.s_journal_inum),
-                    &inode_stats,
-                    metadata_checksum,
-                    &|blk| dev.read_block(blk, block_size).ok(),
-                );
-                inode_validation_tracking_time += operation_started.elapsed();
                 group_bytes = table_bytes.len() as u64;
                 all_scanned_inodes.push((bg_idx, inodes));
             }
@@ -915,6 +907,38 @@ fn main() -> ExitCode {
         stats.record_group(bg_idx, group_bytes, 1, group_had_error);
         live_metrics.update(&stats);
     }
+
+    // All inode-referenced xattr and journal data blocks have now been found.
+    // Pre-discover external extent-tree nodes too, so cross-inode data pointers
+    // cannot evade metadata-overlap checks due to inode scan order.
+    let metadata_schedule_started = Instant::now();
+    let extent_metadata_tracker = BlockAllocationTracker::new_sparse(sb.total_blocks());
+    for (_, inodes) in &all_scanned_inodes {
+        for inode in inodes {
+            for block in collect_inode_extent_tree_blocks(inode, &|block| {
+                dev.read_block(block, block_size).ok()
+            }) {
+                extent_metadata_tracker.mark_range(block, 1);
+            }
+        }
+    }
+    for (bg_idx, inodes) in &all_scanned_inodes {
+        let first_inode = (*bg_idx as u32) * sb.inodes_per_group() + 1;
+        let operation_started = Instant::now();
+        verify_inodes_parallel_with_metadata(
+            inodes,
+            first_inode,
+            &tracker,
+            Some(&protected_metadata_tracker),
+            Some(&extent_metadata_tracker),
+            u32::from_le(sb.s_journal_inum),
+            &inode_stats,
+            metadata_checksum,
+            &|blk| dev.read_block(blk, block_size).ok(),
+        );
+        inode_validation_tracking_time += operation_started.elapsed();
+    }
+    inode_metadata_collection_time += metadata_schedule_started.elapsed();
     profile.mark("inode_table_scanning_extent_tree_parsing");
     profile.record("inode_table_reads", inode_table_read_time);
     profile.record("inode_decoding", inode_decode_time);

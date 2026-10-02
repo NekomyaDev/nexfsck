@@ -1048,6 +1048,17 @@ impl BlockAllocationTracker {
             .ok()
             .filter(|words| *words <= (64 * 1024 * 1024 / 8))
             .map(|words| RwLock::new(vec![0; words]));
+        Self::with_dense_words(total_blocks, dense_words)
+    }
+
+    /// Creates a sparse tracker for metadata classes with few scattered blocks.
+    /// This avoids allocating a second filesystem-sized bitset just to remember
+    /// extent-tree nodes during metadata-overlap validation.
+    pub fn new_sparse(total_blocks: u64) -> Self {
+        Self::with_dense_words(total_blocks, None)
+    }
+
+    fn with_dense_words(total_blocks: u64, dense_words: Option<RwLock<Vec<u64>>>) -> Self {
         Self {
             total_blocks,
             allocated_count: AtomicU64::new(0),
@@ -1171,6 +1182,7 @@ pub fn verify_inodes_parallel<F>(
         first_inode_number,
         tracker,
         None,
+        None,
         0,
         stats,
         metadata_checksum,
@@ -1184,6 +1196,7 @@ pub fn verify_inodes_parallel_with_metadata<F>(
     first_inode_number: u32,
     tracker: &BlockAllocationTracker,
     protected_metadata: Option<&BlockAllocationTracker>,
+    extent_metadata: Option<&BlockAllocationTracker>,
     metadata_owner_inode: u32,
     stats: &InodeVerificationStats,
     metadata_checksum: Ext4MetadataChecksum,
@@ -1236,6 +1249,7 @@ pub fn verify_inodes_parallel_with_metadata<F>(
                 tracker.total_blocks(),
                 tracker,
                 protected_metadata,
+                extent_metadata,
                 stats,
                 read_block_fn,
                 0,
@@ -1324,6 +1338,7 @@ pub fn verify_extent_block<F>(
         max_blocks,
         tracker,
         None,
+        None,
         stats,
         read_block_fn,
         current_depth,
@@ -1337,6 +1352,7 @@ fn verify_extent_block_with_metadata<F>(
     max_blocks: u64,
     tracker: &BlockAllocationTracker,
     protected_metadata: Option<&BlockAllocationTracker>,
+    extent_metadata: Option<&BlockAllocationTracker>,
     stats: &InodeVerificationStats,
     read_block_fn: &F,
     current_depth: u16,
@@ -1349,6 +1365,7 @@ fn verify_extent_block_with_metadata<F>(
         max_blocks,
         tracker,
         protected_metadata,
+        extent_metadata,
         stats,
         read_block_fn: &read_block_fn,
     };
@@ -1366,6 +1383,7 @@ where
     max_blocks: u64,
     tracker: &'a BlockAllocationTracker,
     protected_metadata: Option<&'a BlockAllocationTracker>,
+    extent_metadata: Option<&'a BlockAllocationTracker>,
     stats: &'a InodeVerificationStats,
     read_block_fn: &'a F,
 }
@@ -1491,6 +1509,8 @@ where
                     .fetch_add(1, Ordering::Relaxed);
             } else if context.protected_metadata.is_some_and(|metadata| {
                 (start_block..physical_end).any(|block| metadata.is_allocated(block))
+            }) || context.extent_metadata.is_some_and(|metadata| {
+                (start_block..physical_end).any(|block| metadata.is_allocated(block))
             }) {
                 context
                     .stats
@@ -1558,7 +1578,7 @@ where
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if let Some(metadata) = context.protected_metadata {
+            if let Some(metadata) = context.extent_metadata {
                 metadata.mark_range(child_block, 1);
             }
             if !context.tracker.mark_range(child_block, 1) {
@@ -1981,6 +2001,75 @@ where
     extents
 }
 
+/// Collects physical blocks used by external extent-tree nodes. This is a
+/// bounded ownership-discovery prepass; full validation remains in
+/// `verify_inodes_parallel_with_metadata`.
+pub fn collect_inode_extent_tree_blocks<F>(inode: &Ext4Inode, read_block_fn: &F) -> Vec<u64>
+where
+    F: Fn(u64) -> Option<Vec<u8>>,
+{
+    let mut blocks = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    if inode.uses_extents() && !inode.is_inline_data() {
+        collect_extent_tree_blocks_from_node(
+            &inode.i_block,
+            read_block_fn,
+            0,
+            &mut visited,
+            &mut blocks,
+        );
+    }
+    blocks
+}
+
+fn collect_extent_tree_blocks_from_node<F>(
+    data: &[u8],
+    read_block_fn: &F,
+    depth: u16,
+    visited: &mut std::collections::HashSet<u64>,
+    out: &mut Vec<u64>,
+) where
+    F: Fn(u64) -> Option<Vec<u8>>,
+{
+    if depth > 5 {
+        return;
+    }
+    let Ok((header, rest)) = Ext4ExtentHeader::ref_from_prefix(data) else {
+        return;
+    };
+    if !header.is_valid_magic()
+        || header.entries() > header.max()
+        || header.depth() == 0
+        || header.entries() as usize > rest.len() / std::mem::size_of::<Ext4ExtentIdx>()
+    {
+        return;
+    }
+    let entry_size = std::mem::size_of::<Ext4ExtentIdx>();
+    for index in 0..header.entries() as usize {
+        let offset = index.saturating_mul(entry_size);
+        let Some(bytes) = rest.get(offset..) else {
+            break;
+        };
+        let Ok((entry, _)) = Ext4ExtentIdx::ref_from_prefix(bytes) else {
+            break;
+        };
+        let child = entry.child_block();
+        if child == 0 || !visited.insert(child) {
+            continue;
+        }
+        out.push(child);
+        if let Some(child_data) = read_block_fn(child) {
+            collect_extent_tree_blocks_from_node(
+                &child_data,
+                read_block_fn,
+                depth + 1,
+                visited,
+                out,
+            );
+        }
+    }
+}
+
 fn collect_extents_from_node<F>(
     data: &[u8],
     read_block_fn: &F,
@@ -2176,6 +2265,7 @@ mod extent_semantic_tests {
             100,
             &tracker,
             Some(&protected),
+            None,
             &stats,
             &|_| None,
             0,
