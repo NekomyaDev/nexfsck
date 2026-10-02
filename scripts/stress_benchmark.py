@@ -392,7 +392,7 @@ def run_endurance_stress_test():
         max_rss_list.append(rss_kb)
         
         if round_num % 5 == 0 or round_num == 1:
-            print(f"  [Round {round_num:02d}/30] Elapsed: {t_el:.3f}s | Max RSS: {rss_kb/1024:.2f} MiB | Exit: {p.returncode}")
+            print(f"  [Round {round_num:02d}/30] Elapsed: {external_elapsed:.3f}s | Max RSS: {rss_kb/1024:.2f} MiB | Exit: {p.returncode}")
             
         assert p.returncode == 0, f"Round {round_num} failed with code {p.returncode}"
         
