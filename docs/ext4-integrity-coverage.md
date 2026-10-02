@@ -37,6 +37,15 @@ the underlying metadata.
 | External xattr blocks | Checksum-valid inode references and xattr block reads | Cross-inode references counted; corrupt/unknown xattr references block repair |
 | Other metadata (quota, orphan, ea_inode, MMP, verity, etc.) | Feature policy | Explicitly rejected where their ownership/semantics are not implemented; not silently considered protected or clean |
 
+Current real-image extent-ownership mutations redirect a checksum-valid file
+extent to the block bitmap, inode bitmap, inode table, primary GDT, backup
+superblock, and its external xattr block. Each must increment
+`extent_metadata_overlap_failures`, block repair, and preserve the image on a
+repair attempt. Superblock block zero itself is not used as a data target
+because ext4 reserves physical block zero and the checker independently treats
+it as an invalid data address; external extent-node overlap is not yet in this
+real-image mutation set.
+
 ### JBD2 support matrix
 
 | Mode | Status |

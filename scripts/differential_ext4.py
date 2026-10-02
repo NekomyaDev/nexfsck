@@ -192,6 +192,12 @@ def run_differential_case(binary, image, case_id, corruption_class, fixture_hash
         },
         "agreement": nex_detected == e2_detected,
         "agreement_class": agreement_class,
+        "disagreement_class": None if nex_detected == e2_detected else (
+            "e2fsck_reports_but_exit_semantics_differ"
+            if e2_diagnostic_detected and e2.returncode == 0
+            else "likely_nexfsck_missing_validation" if e2_detected and not nex_detected
+            else "nexfsck_stricter_validation"
+        ),
         "exit_code_agreement": nex.returncode == e2.returncode,
         "expected_result": "Nexfsck detects corruption; e2fsck behavior is recorded independently",
     }
@@ -227,6 +233,25 @@ def parse_dumpe2fs(image):
     desc_table_block = 2 if block_size == 1024 else 1
     desc_size = int(values.get("Group descriptor size", "32"))
     return values, block_size, desc_table_block * block_size, desc_size, int(fields[4]), int(fields[5])
+
+
+def parse_metadata_targets(image):
+    result = run(["dumpe2fs", "-g", str(image)])
+    rows = [line.split(":") for line in result.stdout.splitlines()
+            if line and line[0].isdigit()]
+    group0 = next(row for row in rows if row[0] == "0")
+    def first_block(value):
+        return int(value.split("-", 1)[0])
+    targets = {
+        "block_bitmap": int(group0[4]),
+        "inode_bitmap": int(group0[5]),
+        "inode_table": int(group0[6]),
+        "gdt": first_block(group0[3]),
+    }
+    backup = next((row for row in rows if row[0] == "1" and row[2] != "-"), None)
+    if backup is not None:
+        targets["backup_superblock"] = int(backup[2])
+    return targets
 
 
 def inode_checksum_offset(image):
@@ -295,7 +320,7 @@ def make_extent_overlap_fixture(image, work):
     source = work / "extent-overlap-source"
     source.mkdir()
     (source / "file").write_bytes(b"extent target" * 1024)
-    subprocess.check_call(["truncate", "-s", "128M", str(image)])
+    subprocess.check_call(["truncate", "-s", "512M", str(image)])
     subprocess.check_call(["mkfs.ext4", "-q", "-F", "-O", "metadata_csum", "-d",
                            str(source), str(image)])
     stat = run(["debugfs", "-R", "stat /file", str(image)])
@@ -303,8 +328,8 @@ def make_extent_overlap_fixture(image, work):
     if not match:
         raise RuntimeError("cannot locate file inode in extent-overlap fixture")
     inode_number = int(match.group(1))
-    _, block_size, _, _, block_bitmap, _ = parse_dumpe2fs(image)
-    return inode_number, block_size, block_bitmap
+    _, block_size, _, _, _, _ = parse_dumpe2fs(image)
+    return inode_number, block_size, parse_metadata_targets(image)
 
 
 def main():
@@ -407,15 +432,17 @@ def main():
                 "differential_classification": classification,
                 "exit_code_agreement": nex.returncode == e2.returncode,
                 "disagreement_class": None if nex_detected == e2_detected else (
-                    "e2fsck_reports_but_exit_semantics_differ" if e2_diagnostic_detected and e2.returncode == 0
+                    "scope_difference" if case_id == "backup_superblock_checksum"
+                    else "e2fsck_reports_but_exit_semantics_differ"
+                    if e2_diagnostic_detected and e2.returncode == 0
                     else "likely_nexfsck_missing_validation" if e2_detected
-                    else "requires_manual_review"
+                    else "nexfsck_stricter_validation"
                 ),
                 "expected": "nexfsck detects corruption; e2fsck result is recorded as oracle data",
             })
 
         extent_clean = work / "extent-overlap-clean.ext4"
-        extent_inode, extent_block_size, target_bitmap = make_extent_overlap_fixture(
+        extent_inode, extent_block_size, metadata_targets = make_extent_overlap_fixture(
             extent_clean, work
         )
         extent_fixture_hash = sha256_file(extent_clean)
@@ -424,36 +451,42 @@ def main():
             raise RuntimeError(
                 f"generated extent-overlap fixture is not clean: {clean_extent.stdout}{clean_extent.stderr}"
             )
-        overlap_image = work / "extent_overlaps_block_bitmap.ext4"
-        shutil.copyfile(extent_clean, overlap_image)
-        mutate_inode_extent_target(overlap_image, extent_inode, target_bitmap)
-        overlap_case = run_differential_case(
-            binary, overlap_image, "extent_overlap_block_bitmap", "extent_metadata_overlap",
-            extent_fixture_hash,
-            {"inode": extent_inode, "target_block": target_bitmap,
-             "target_metadata_class": "block_bitmap",
-             "operation": "redirect first file extent to group descriptor block bitmap; recompute inode checksum"},
-            source_commit, binary_hash,
-        )
-        image_before_repair = sha256_file(overlap_image)
-        repair_command = [str(binary), "--json", "-r", str(overlap_image)]
-        repair_result = run(repair_command)
-        image_after_repair = sha256_file(overlap_image)
-        repair_counters = parse_structured_json(repair_result.stdout) or {}
-        overlap_case["repair_attempt"] = {
-            "command": repair_command,
-            "exit_code": repair_result.returncode,
-            "structured_counters": repair_counters,
-            "image_sha256_before": image_before_repair,
-            "image_sha256_after": image_after_repair,
-            "image_unchanged": image_before_repair == image_after_repair,
-        }
-        overlap_counters = overlap_case["nexfsck"]["structured_counters"] or {}
-        overlap_case["expected_counter"] = "extent_metadata_overlap_failures"
-        overlap_case["counter_observed"] = overlap_counters.get(
-            "extent_metadata_overlap_failures", 0
-        )
-        records.append(overlap_case)
+        for metadata_class in (
+            "block_bitmap", "inode_bitmap", "inode_table", "gdt", "backup_superblock"
+        ):
+            target = metadata_targets.get(metadata_class)
+            if target is None:
+                continue
+            case_id = f"extent_overlap_{metadata_class}"
+            overlap_image = work / f"{case_id}.ext4"
+            shutil.copyfile(extent_clean, overlap_image)
+            mutate_inode_extent_target(overlap_image, extent_inode, target)
+            overlap_case = run_differential_case(
+                binary, overlap_image, case_id, "extent_metadata_overlap", extent_fixture_hash,
+                {"inode": extent_inode, "target_block": target,
+                 "target_metadata_class": metadata_class,
+                 "operation": f"redirect first file extent to {metadata_class}; recompute inode checksum"},
+                source_commit, binary_hash,
+            )
+            image_before_repair = sha256_file(overlap_image)
+            repair_command = [str(binary), "--json", "-r", str(overlap_image)]
+            repair_result = run(repair_command)
+            image_after_repair = sha256_file(overlap_image)
+            repair_counters = parse_structured_json(repair_result.stdout) or {}
+            overlap_case["repair_attempt"] = {
+                "command": repair_command,
+                "exit_code": repair_result.returncode,
+                "structured_counters": repair_counters,
+                "image_sha256_before": image_before_repair,
+                "image_sha256_after": image_after_repair,
+                "image_unchanged": image_before_repair == image_after_repair,
+            }
+            overlap_counters = overlap_case["nexfsck"]["structured_counters"] or {}
+            overlap_case["expected_counter"] = "extent_metadata_overlap_failures"
+            overlap_case["counter_observed"] = overlap_counters.get(
+                "extent_metadata_overlap_failures", 0
+            )
+            records.append(overlap_case)
 
         xattr_source = work / "xattr-source"
         xattr_source.mkdir()
