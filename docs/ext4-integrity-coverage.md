@@ -54,12 +54,12 @@ real-image mutation set.
 | Checksum v1 | Rejected |
 | Checksum v2 | Rejected |
 | Checksum v3 superblock | Validated |
-| Checksum v3 descriptor/commit/revoke transaction blocks | Unimplemented; dirty journal fails clean/repair eligibility |
-| Descriptor validation | Helper parser only; not integrated into on-disk inspection |
-| Descriptor checksum | Unimplemented |
-| Commit checksum | Unimplemented |
-| Revoke checksum | Unimplemented |
-| 64-bit journal tags | Parsed in helper tests; on-disk transaction stream rejected/not supported |
+| Checksum v3 descriptor/commit/revoke transaction blocks | Verification-only in replay-plan block-stream API; not traversed by filesystem inspection, and dirty journal still fails clean/repair eligibility |
+| Descriptor validation | Verification-only helper: bounds, UUID, flags, LAST_TAG, target block range |
+| Descriptor checksum | Verification-only helper: v3 CRC32c against journal UUID seed |
+| Commit checksum | Verification-only helper: CRC32c/type/size validation |
+| Revoke checksum | Verification-only helper: v3 CRC32c, used-byte bounds, and target bounds |
+| 64-bit journal tags | Verification-only helper supports v3 high block word; on-disk transaction stream not traversed |
 | Async commit | Rejected |
 | Dirty journal replay | Rejected; no replay attempted |
 | External journal | Rejected |

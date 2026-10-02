@@ -29,7 +29,7 @@ This inventory reflects the automated tests currently in the repository. It is d
 | Orphan-file semantics and unknown incompat/RO-compat bits fail closed with valid superblock checksum | `test_unknown_incompat_and_ro_compat_bits_fail_closed` |
 | H-Tree root/leaf validation and child bounds | `validates_minimal_htree_root_and_leaf`, `rejects_out_of_bounds_htree_child` |
 | CUDA/CPU collision equivalence; CUDA required with env flag | `collision_detection_is_deterministic` |
-| JBD2 committed, incomplete, revoked, checksum-v3, and 64-bit transactions | `plans_only_committed_jbd2_data`, `ignores_uncommitted_tail`, `revoke_removes_committed_write`, `validates_checksum_v3_and_64bit_target` |
+| JBD2 synthetic block-stream planning and v3 metadata checksums | `plans_only_committed_jbd2_data`, `ignores_uncommitted_tail`, `revoke_removes_committed_write`, `validates_checksum_v3_and_64bit_target`, `verifies_v3_descriptor_commit_and_revoke_checksums` (not wired into on-disk filesystem inspection) |
 | JBD2 unknown incompat and unvalidated compat-checksum policy | `journal_feature_policy_rejects_unknown_and_unvalidated_checksum_modes` |
 | Interrupted JBD2 replay and durable pre-image rollback | `interrupted_replay_can_be_rolled_back_from_synced_preimages` |
 | Heatmap/rates and Prometheus format | `heatmap_and_rates_are_reported`, `prometheus_contains_all_counters` |

@@ -289,6 +289,9 @@ pub fn build_replay_plan_with_features(
             cursor += 1;
             continue;
         }
+        if features.checksum_v3 {
+            validate_jbd2_v3_block_checksum(&log_blocks[cursor], features.uuid, false)?;
+        }
         let tags = parse_descriptor_tags(&log_blocks[cursor], features)?;
         let data_start = cursor + 1;
         let data_count = tags
@@ -310,9 +313,25 @@ pub fn build_replay_plan_with_features(
             }
             match trailer_header.block_type() {
                 JBD2_REVOKE_BLOCK => {
-                    parse_revoke_block(&log_blocks[trailer], &mut revoked, features.block_64bit)?
+                    if features.checksum_v3 {
+                        validate_jbd2_v3_block_checksum(
+                            &log_blocks[trailer],
+                            features.uuid,
+                            false,
+                        )?;
+                    }
+                    parse_revoke_block(
+                        &log_blocks[trailer],
+                        &mut revoked,
+                        features.block_64bit,
+                        filesystem_blocks,
+                        features.checksum_v3,
+                    )?
                 }
                 JBD2_COMMIT_BLOCK => {
+                    if features.checksum_v3 {
+                        validate_jbd2_v3_block_checksum(&log_blocks[trailer], features.uuid, true)?;
+                    }
                     committed = true;
                     trailer += 1;
                     break;
@@ -381,8 +400,9 @@ fn parse_descriptor_tags(
 ) -> Result<Vec<(u64, u32, Option<u32>)>, JournalError> {
     let mut tags = Vec::new();
     let mut offset = 12usize;
+    let limit = block.len() - usize::from(features.checksum_v3) * 4;
     loop {
-        if offset + 8 > block.len() {
+        if offset + 8 > limit {
             return Err(JournalError::CorruptLog(
                 "truncated JBD2 descriptor tag".into(),
             ));
@@ -391,7 +411,7 @@ fn parse_descriptor_tags(
         let flags = u32::from_be_bytes(block[offset + 4..offset + 8].try_into().unwrap());
         offset += 8;
         let checksum = if features.checksum_v3 {
-            if offset + 8 > block.len() {
+            if offset + 8 > limit {
                 return Err(JournalError::CorruptLog("truncated JBD2 v3 tag".into()));
             }
             if features.block_64bit {
@@ -418,10 +438,23 @@ fn parse_descriptor_tags(
             }
             None
         };
+        const KNOWN_FLAGS: u32 =
+            JBD2_FLAG_ESCAPE | JBD2_FLAG_SAME_UUID | JBD2_FLAG_DELETED | JBD2_FLAG_LAST_TAG;
+        if flags & !KNOWN_FLAGS != 0 {
+            return Err(JournalError::CorruptLog(format!(
+                "unsupported JBD2 descriptor tag flags 0x{:x}",
+                flags & !KNOWN_FLAGS
+            )));
+        }
         tags.push((target, flags, checksum));
-        if !features.checksum_v3 && flags & JBD2_FLAG_SAME_UUID == 0 {
-            if offset + 16 > block.len() {
+        if flags & JBD2_FLAG_SAME_UUID == 0 {
+            if offset + 16 > limit {
                 return Err(JournalError::CorruptLog("truncated JBD2 tag UUID".into()));
+            }
+            if features.checksum_v3 && block[offset..offset + 16] != features.uuid {
+                return Err(JournalError::CorruptLog(
+                    "JBD2 tag UUID does not match journal UUID".into(),
+                ));
             }
             offset += 16;
         }
@@ -436,6 +469,8 @@ fn parse_revoke_block(
     block: &[u8],
     revoked: &mut std::collections::HashSet<u64>,
     block_64bit: bool,
+    filesystem_blocks: u64,
+    has_checksum_tail: bool,
 ) -> Result<(), JournalError> {
     if block.len() < 16 {
         return Err(JournalError::CorruptLog(
@@ -444,7 +479,8 @@ fn parse_revoke_block(
     }
     let used = u32::from_be_bytes(block[12..16].try_into().unwrap()) as usize;
     let entry_size = if block_64bit { 8 } else { 4 };
-    if used < 16 || used > block.len() || (used - 16) & (entry_size - 1) != 0 {
+    let limit = block.len() - usize::from(has_checksum_tail) * 4;
+    if used < 16 || used > limit || (used - 16) & (entry_size - 1) != 0 {
         return Err(JournalError::CorruptLog(
             "invalid JBD2 revoke length".into(),
         ));
@@ -455,7 +491,54 @@ fn parse_revoke_block(
         } else {
             u32::from_be_bytes(entry.try_into().unwrap()) as u64
         };
+        if value >= filesystem_blocks {
+            return Err(JournalError::CorruptLog(format!(
+                "JBD2 revoke target block {value} is out of bounds"
+            )));
+        }
         revoked.insert(value);
+    }
+    Ok(())
+}
+
+/// Verify a JBD2 v2/v3 metadata-block checksum. Descriptor and revoke blocks
+/// store the CRC32c in the final word; commit blocks store it at offset 16.
+/// Linux seeds these checksums with CRC32c(~0, journal UUID).
+fn validate_jbd2_v3_block_checksum(
+    block: &[u8],
+    uuid: [u8; 16],
+    is_commit: bool,
+) -> Result<(), JournalError> {
+    let mut bytes = block.to_vec();
+    let checksum_offset = if is_commit {
+        if block.len() < 20 || block[12] != 4 || block[13] != 4 {
+            return Err(JournalError::CorruptLog(
+                "unsupported JBD2 commit checksum type or size".into(),
+            ));
+        }
+        16
+    } else {
+        if block.len() < 16 {
+            return Err(JournalError::CorruptLog(
+                "truncated JBD2 checksum block".into(),
+            ));
+        }
+        block.len() - 4
+    };
+    let provided = u32::from_be_bytes(
+        block[checksum_offset..checksum_offset + 4]
+            .try_into()
+            .unwrap(),
+    );
+    bytes[checksum_offset..checksum_offset + 4].fill(0);
+    let seed = crc32c_kernel(!0, &uuid);
+    let calculated = crc32c_kernel(seed, &bytes);
+    if provided != calculated {
+        return Err(JournalError::CorruptLog(if is_commit {
+            "JBD2 commit checksum mismatch".into()
+        } else {
+            "JBD2 descriptor/revoke checksum mismatch".into()
+        }));
     }
     Ok(())
 }
@@ -780,6 +863,18 @@ mod tests {
         block
     }
 
+    fn seal_v3_metadata(block: &mut [u8], uuid: [u8; 16], is_commit: bool) {
+        let offset = if is_commit { 16 } else { block.len() - 4 };
+        block[offset..offset + 4].fill(0);
+        if is_commit {
+            block[12] = 4;
+            block[13] = 4;
+        }
+        let seed = crc32c_kernel(!0, &uuid);
+        let checksum = crc32c_kernel(seed, block);
+        block[offset..offset + 4].copy_from_slice(&checksum.to_be_bytes());
+    }
+
     #[test]
     fn journal_feature_policy_rejects_unknown_and_unvalidated_checksum_modes() {
         let mut superblock = vec![0u8; 64];
@@ -884,7 +979,9 @@ mod tests {
         descriptor[20..24].copy_from_slice(&((target >> 32) as u32).to_be_bytes());
         descriptor[24..28]
             .copy_from_slice(&jbd2_tag_checksum(features.uuid, sequence, &data).to_be_bytes());
-        let commit = header(JBD2_COMMIT_BLOCK, sequence, 64);
+        seal_v3_metadata(&mut descriptor, features.uuid, false);
+        let mut commit = header(JBD2_COMMIT_BLOCK, sequence, 64);
+        seal_v3_metadata(&mut commit, features.uuid, true);
         let plan = build_replay_plan_with_features(
             &[descriptor.clone(), data.clone(), commit.clone()],
             sequence,
@@ -903,6 +1000,48 @@ mod tests {
             features,
         )
         .is_err());
+    }
+
+    #[test]
+    fn verifies_v3_descriptor_commit_and_revoke_checksums() {
+        let features = JournalFeatures {
+            block_64bit: false,
+            checksum_v3: true,
+            uuid: *b"journal-uuid-001",
+        };
+        let sequence = 27;
+        let mut descriptor = header(JBD2_DESCRIPTOR_BLOCK, sequence, 64);
+        descriptor[12..16].copy_from_slice(&42u32.to_be_bytes());
+        descriptor[16..20]
+            .copy_from_slice(&(JBD2_FLAG_SAME_UUID | JBD2_FLAG_LAST_TAG).to_be_bytes());
+        let data = vec![0x6b; 64];
+        descriptor[24..28]
+            .copy_from_slice(&jbd2_tag_checksum(features.uuid, sequence, &data).to_be_bytes());
+        seal_v3_metadata(&mut descriptor, features.uuid, false);
+
+        let mut revoke = header(JBD2_REVOKE_BLOCK, sequence, 64);
+        revoke[12..16].copy_from_slice(&20u32.to_be_bytes());
+        revoke[16..20].copy_from_slice(&42u32.to_be_bytes());
+        seal_v3_metadata(&mut revoke, features.uuid, false);
+
+        let mut commit = header(JBD2_COMMIT_BLOCK, sequence, 64);
+        seal_v3_metadata(&mut commit, features.uuid, true);
+        let blocks = vec![
+            descriptor.clone(),
+            data.clone(),
+            revoke.clone(),
+            commit.clone(),
+        ];
+        let plan = build_replay_plan_with_features(&blocks, sequence, 100, features).unwrap();
+        assert_eq!(plan.committed_transactions, 1);
+        assert!(plan.writes.is_empty());
+
+        for mutate in [0usize, 2, 3] {
+            let mut corrupt = blocks.clone();
+            let last = corrupt[mutate].len() - 1;
+            corrupt[mutate][last] ^= 1;
+            assert!(build_replay_plan_with_features(&corrupt, sequence, 100, features).is_err());
+        }
     }
 
     #[test]
