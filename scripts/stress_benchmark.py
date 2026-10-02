@@ -20,13 +20,15 @@ import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 IMG_PATH = os.environ.get("NEXFSCK_BENCH_IMAGE", "/tmp/stress_10g.img")
-MNT_PATH = "/tmp/stress_mnt"
-UNDO_LOG = "/tmp/stress_10g_repair.undo"
-CORRUPT_IMG = "/tmp/stress_10g_corrupt.img"
-REPO_ROOT = "/home/pop-os/nexfsck"
-NEXFSCK_BIN = f"{REPO_ROOT}/target/release/nexfsck"
+BENCH_DIR = os.path.dirname(os.path.abspath(IMG_PATH))
+MNT_PATH = os.environ.get("NEXFSCK_BENCH_MOUNT", "/tmp/stress_mnt")
+UNDO_LOG = os.environ.get("NEXFSCK_UNDO_LOG", os.path.join(BENCH_DIR, "stress_10g_repair.undo"))
+CORRUPT_IMG = os.environ.get("NEXFSCK_CORRUPT_IMAGE", os.path.join(BENCH_DIR, "stress_10g_corrupt.img"))
+REPO_ROOT = str(Path(__file__).resolve().parents[1])
+NEXFSCK_BIN = os.environ.get("NEXFSCK_BIN", f"{REPO_ROOT}/target/release/nexfsck")
 RESULT_DIR = os.environ.get(
     "NEXFSCK_BENCH_RESULTS_DIR", "/home/pop-os/nexfsck/benchmark-results"
 )
@@ -98,6 +100,17 @@ def sha256_file(path):
 def percentile(values, fraction):
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1, max(0, int(len(ordered) * fraction + 0.999999) - 1))]
+
+def parse_json_output(output):
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", output):
+        try:
+            value, _ = decoder.raw_decode(output[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and "errors_detected" in value:
+            return value
+    return None
 
 def timed_run(command):
     started = time.perf_counter()
@@ -284,6 +297,10 @@ def run_ground_truth_test():
     
     assert e2_blocks == nex_blocks, f"Block count mismatch: {e2_blocks} != {nex_blocks}"
     assert nex_errors == 0, f"nexfsck reported errors on clean filesystem: {nex_errors}"
+    validation = subprocess.run(
+        [NEXFSCK_BIN, "--json", "-n", IMG_PATH], capture_output=True, text=True, check=True
+    )
+    validation_counters = parse_json_output(validation.stdout)
     return {
         "runs": COMPARISON_RUNS,
         "cache_policy": "interleaved warm-cache; no global cache drop",
@@ -306,6 +323,7 @@ def run_ground_truth_test():
         "nexfsck_allocated_blocks": nex_blocks,
         "nexfsck_directory_entries": nex_entries,
         "nexfsck_errors": nex_errors,
+        "nexfsck_validation_counters": validation_counters,
     }
 
 def run_backend_matrix():
@@ -337,12 +355,17 @@ def run_backend_matrix():
     )
     with open(f"{RESULT_DIR}/profile.stderr.log", "w") as f:
         f.write(profile.stderr)
+    profile_counters = parse_json_output(profile.stdout)
     stages = {}
     for line in profile.stderr.splitlines():
         match = re.search(r"stage=(\S+) milliseconds=([0-9.]+)", line)
         if match:
             stages[match.group(1)] = float(match.group(2))
-    return {"modes": result, "adaptive_profile_milliseconds": stages}
+    return {
+        "modes": result,
+        "adaptive_profile_milliseconds": stages,
+        "validation_counters": profile_counters,
+    }
 
 def run_endurance_stress_test():
     print("\n" + "=" * 70)
@@ -355,7 +378,9 @@ def run_endurance_stress_test():
     print(f"Executing 30 consecutive full passes over 10.0 GiB storage with 100,000+ inodes across 80 groups...")
     for round_num in range(1, 31):
         cmd = ["/usr/bin/time", "-v", NEXFSCK_BIN, "-n", IMG_PATH]
+        started = time.perf_counter()
         p = subprocess.run(cmd, capture_output=True, text=True)
+        external_elapsed = time.perf_counter() - started
         
         rss_kb = 0
         for line in p.stderr.splitlines():
@@ -363,13 +388,7 @@ def run_endurance_stress_test():
                 m = re.search(r":\s+(\d+)", line)
                 if m: rss_kb = int(m.group(1))
                 
-        t_el = 0.0
-        for line in p.stdout.splitlines():
-            if "Elapsed Time" in line:
-                m = re.search(r":\s+([\d\.]+)s", line)
-                if m: t_el = float(m.group(1))
-                
-        times.append(t_el)
+        times.append(external_elapsed)
         max_rss_list.append(rss_kb)
         
         if round_num % 5 == 0 or round_num == 1:
@@ -557,7 +576,9 @@ def main():
                     "/tmp tmpfs (memory-backed live-USB environment)",
                 ),
                 "e2fsck_version": subprocess.run(["e2fsck", "-V"], capture_output=True, text=True).stderr.strip(),
+                "mkfs.ext4_version": subprocess.run(["mkfs.ext4", "-V"], capture_output=True, text=True).stderr.strip(),
                 "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
+                "python": platform.python_version(),
             },
             "comparison": comparison,
             "backend_matrix": backend_matrix,
